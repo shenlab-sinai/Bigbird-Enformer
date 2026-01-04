@@ -374,6 +374,16 @@ class Enformer(PreTrainedModel):
 
         self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
+        self.injector = PeriodicTokenInjector(
+                dim=config.dim, 
+                block_size=self.block_size, 
+                tokens_per_chunk=self.dna_chunk_len
+            )
+        
+        self.remover = PeriodicTokenRemover(
+                block_size=self.block_size,
+                tokens_per_chunk=self.dna_chunk_len
+            )
         # create trunk sequential module
 
         self._trunk = nn.Sequential(
@@ -382,18 +392,11 @@ class Enformer(PreTrainedModel):
             self.conv_tower,
             Rearrange('b d n -> b n d'),
             # Inject CLS tokens before pos_embedding and transformer
-            PeriodicTokenInjector(
-                dim=config.dim, 
-                block_size=self.block_size, 
-                tokens_per_chunk=self.dna_chunk_len
-            ),
+            self.injector,
             self.pos_embedding,
             self.transformer,
             # Remove CLS tokens before final layers
-            PeriodicTokenRemover(
-                block_size=self.block_size,
-                tokens_per_chunk=self.dna_chunk_len
-            ),
+            self.remover,
             self.crop_final,
             self.final_pointwise
         )
@@ -431,7 +434,10 @@ class Enformer(PreTrainedModel):
         x = self.stem(x)
         x = self.conv_tower(x)
         x = rearrange(x, 'b d n -> b n d')
+        x = self.injector(x)
+        x = self.pos_embedding(x)
         x = checkpoint_sequential(self.transformer, len(self.transformer), x)
+        x = self.remover(x)
         x = self.crop_final(x)
         x = self.final_pointwise(x)
         return x
