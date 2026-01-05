@@ -68,10 +68,7 @@ def bigbird_block_sparse_attention(q, k, v, block_size, global_indices):
     # Add contribution from Global Keys
     attn_global_cols = F.softmax(global_col_scores * scale, dim=-1)
     g_v_flat = g_v_blocks.view(b, h, -1, d)
-    out_from_global_keys = torch.matmul(attn_global_cols, g_v_flat)
-    
-    # Reshape to match blocks
-    out_from_global_keys = out_from_global_keys.view(b, h, num_blocks, block_size, d)
+    out_from_global_keys = torch.einsum("bhnqg, bhgd -> bhnqd", attn_global_cols, g_v_flat)
     
     # Combine Local + Global Context
     final_out = out_local + out_from_global_keys

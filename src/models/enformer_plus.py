@@ -25,9 +25,9 @@ from torch.utils.checkpoint import checkpoint_sequential
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
-from src.utils.data import str_to_one_hot, seq_indices_to_one_hot
-from src.utils.config import EnformerConfig
-from src.layers.attention import BigBirdAttention
+from ..utils.data import str_to_one_hot, seq_indices_to_one_hot
+from ..utils.config import EnformerConfig
+from ..layers.attention import BigBirdAttention
 
 from transformers import PreTrainedModel
 
