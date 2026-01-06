@@ -40,6 +40,9 @@ one_hot_embed[ord('.')] = torch.Tensor([0.25, 0.25, 0.25, 0.25])
 
 reverse_complement_map = torch.Tensor([3, 2, 1, 0, 4]).long()
 
+def cast_list(t):
+    return t if isinstance(t, list) else [t]
+
 def torch_fromstring(seq_strs):
     batched = not isinstance(seq_strs, str)
     seq_strs = cast_list(seq_strs)
