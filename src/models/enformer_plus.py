@@ -12,6 +12,13 @@
         Original Enformer uses classic O(N^2) attention.
         That is replaced with BigBird Sparse attention, which is O(N)    
 """
+import sys
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_folder = os.path.dirname(current_dir)      
+project_root = os.path.dirname(src_folder)    
+sys.path.insert(0, project_root)
 
 import math
 from pathlib import Path
@@ -25,9 +32,9 @@ from torch.utils.checkpoint import checkpoint_sequential
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
-from ..utils.data import str_to_one_hot, seq_indices_to_one_hot
-from ..utils.config import EnformerConfig
-from ..layers.attention import BigBirdAttention
+from src.utils.data import str_to_one_hot, seq_indices_to_one_hot
+from src.utils.config import EnformerConfig
+from src.layers.attention import BigBirdAttention
 
 from transformers import PreTrainedModel
 
