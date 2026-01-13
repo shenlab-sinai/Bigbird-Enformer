@@ -34,7 +34,7 @@ from einops.layers.torch import Rearrange
 
 from src.utils.data import str_to_one_hot, seq_indices_to_one_hot
 from src.utils.config import EnformerConfig
-from src.layers.attention import BigBirdAttention
+from src.layers.attention import BigBirdAttention, FullAttention
 
 from transformers import PreTrainedModel
 
@@ -305,6 +305,8 @@ class Enformer(PreTrainedModel):
 
         # create stem
 
+        self.use_full_attention = getattr(config, 'full_attention', False)
+
         self.stem = nn.Sequential(
             nn.Conv1d(4, half_dim, 15, padding = 7),
             Residual(ConvBlock(half_dim)),
@@ -341,15 +343,29 @@ class Enformer(PreTrainedModel):
 
         transformer = []
         for _ in range(config.depth):
+
+            if self.use_full_attention:
+                # Use standard O(N^2) Full Attention
+                attn_layer = FullAttention(
+                    d_model=config.dim,
+                    num_heads=config.heads,
+                    # Block size is ignored by FullAttention but passing it doesn't hurt
+                    block_size=self.block_size 
+                )
+            else:
+                # Use BigBird Sparse Attention
+                attn_layer = BigBirdAutoWrapper(
+                    d_model=config.dim,
+                    num_heads=config.heads,
+                    block_size=self.block_size,
+                    chunk_size_in_blocks=dna_blocks_per_chunk 
+                )
+
+
             transformer.append(nn.Sequential(
                 Residual(nn.Sequential(
                     nn.LayerNorm(config.dim),
-                    BigBirdAutoWrapper(
-                        d_model=config.dim,
-                        num_heads=config.heads,
-                        block_size=self.block_size,
-                        chunk_size_in_blocks=dna_blocks_per_chunk 
-                    ),
+                    attn_layer,
                     nn.Dropout(config.dropout_rate)
                 )),
                 Residual(nn.Sequential(
@@ -381,16 +397,20 @@ class Enformer(PreTrainedModel):
 
         self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
-        self.injector = PeriodicTokenInjector(
-                dim=config.dim, 
-                block_size=self.block_size, 
-                tokens_per_chunk=self.dna_chunk_len
-            )
-        
-        self.remover = PeriodicTokenRemover(
-                block_size=self.block_size,
-                tokens_per_chunk=self.dna_chunk_len
-            )
+        if self.use_full_attention:
+            self.injector = nn.Identity()
+            self.remover = nn.Identity()
+        else:
+            self.injector = PeriodicTokenInjector(
+                    dim=config.dim, 
+                    block_size=self.block_size, 
+                    tokens_per_chunk=self.dna_chunk_len
+                )
+            
+            self.remover = PeriodicTokenRemover(
+                    block_size=self.block_size,
+                    tokens_per_chunk=self.dna_chunk_len
+                )
         # create trunk sequential module
 
         self._trunk = nn.Sequential(

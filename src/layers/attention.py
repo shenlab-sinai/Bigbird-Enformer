@@ -125,3 +125,41 @@ class BigBirdAttention(nn.Module):
         # Final Projection
         context = context.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
         return self.out_proj(context)
+
+class FullAttention(nn.Module):
+    """
+    Standard O(N^2) Attention matching the BigBirdAttention interface.
+    """
+    def __init__(self, d_model, num_heads, block_size=None): 
+        # block_size is unused here but kept for compatibility with BigBird instantiation
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x, global_indices=None):
+        # global_indices is ignored in full attention
+        batch_size, seq_len, _ = x.shape
+        
+        # Project Q, K, V
+        # Shape: [Batch, Heads, Seq_Len, Head_Dim]
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Standard Scaled Dot-Product Attention
+        # Scores: [Batch, Heads, Seq_Len, Seq_Len]
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        
+        context = torch.matmul(attn, v)
+        
+        # Final Projection
+        context = context.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
+        return self.out_proj(context)
