@@ -2,164 +2,128 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from einops import rearrange, reduce
 
-def bigbird_block_sparse_attention(q, k, v, block_size, global_indices):
-    """
-    Sparse Attention with Periodic Global Tokens
-    Implements Periodic Global + Local (Sliding Window).
-    """
-    b, h, n, d = q.shape
-    num_blocks = n // block_size
-    
-    # View as Blocks: [b, h, num_blocks, block_size, head_dim]
-    q_blocks = q.view(b, h, num_blocks, block_size, d)
-    k_blocks = k.view(b, h, num_blocks, block_size, d)
-    v_blocks = v.view(b, h, num_blocks, block_size, d)
+def local_block_sparse_attention(q, k, v, block_size):
+    # q,k,v: [B,H,N,Dh] for non global tokens only
+    B, H, N, Dh = q.shape
+    assert N % block_size == 0, "Non-global length must be divisible by block_size"
+    nb = N // block_size
 
-    # --- Global Attention ---
-    # Gather global blocks based on indices
-    indices_tensor = torch.tensor(global_indices, device=q.device)
-    
-    # [b, h, num_globals, block_size, d]
-    g_q_blocks = torch.index_select(q_blocks, 2, indices_tensor)
-    g_k_blocks = torch.index_select(k_blocks, 2, indices_tensor)
-    g_v_blocks = torch.index_select(v_blocks, 2, indices_tensor)
+    q_blocks = q.view(B, H, nb, block_size, Dh)
+    k_blocks = k.view(B, H, nb, block_size, Dh)
+    v_blocks = v.view(B, H, nb, block_size, Dh)
 
-    # Global Queries (at indices) attending to all keys
-    # Flatten globals to [b, h, num_globals*block_size, d]
-    g_q_flat = g_q_blocks.view(b, h, -1, d)
-    global_row_scores = torch.einsum("bhqd, bhkd -> bhqk", g_q_flat, k)
-    
-    # All Queries attending to Global Keys (at indices)
-    g_k_flat = g_k_blocks.view(b, h, -1, d)
-    global_col_scores = torch.einsum("bhnqd, bhgd -> bhnqg", q_blocks, g_k_flat)
+    k_left  = torch.roll(k_blocks,  1, dims=2)
+    k_right = torch.roll(k_blocks, -1, dims=2)
+    k_window = torch.cat([k_left, k_blocks, k_right], dim=3)  # [B,H,nb,3B,Dh]
 
-    # --- Local Attention ---
-    # Create a window of 3 blocks
-    k_roll_left  = torch.roll(k_blocks, shifts=1, dims=2) # [-1, 0, 1, 2 ...]
-    k_roll_right = torch.roll(k_blocks, shifts=-1, dims=2) # [1, 2, 3, ...]
-    
-    # Concatenate to make [b, h, num_blocks, 3*block_size, head_dim]
-    k_window = torch.cat([k_roll_left, k_blocks, k_roll_right], dim=3)
-    
-    # Queries attend to the Key Window
-    local_scores = torch.einsum("bhnqd, bhnkd -> bhnqk", q_blocks, k_window)
+    v_left  = torch.roll(v_blocks,  1, dims=2)
+    v_right = torch.roll(v_blocks, -1, dims=2)
+    v_window = torch.cat([v_left, v_blocks, v_right], dim=3)
 
-    scale = 1.0 / math.sqrt(d)
-    
-    # --- Compute Outputs ---
-    
-    # Global Rows Output
-    attn_global_rows = F.softmax(global_row_scores * scale, dim=-1)
-    out_global_rows = torch.matmul(attn_global_rows, v) # [b, h, num_globals*block_size, d]
-    # Reshape back to blocks [b, h, num_globals, block_size, d]
-    out_global_rows = out_global_rows.view(b, h, len(global_indices), block_size, d)
-
-    # Local Output
-    attn_local = F.softmax(local_scores * scale, dim=-1)
-    
-    # Construct Value Window (same as Key Window)
-    v_roll_left  = torch.roll(v_blocks, shifts=1, dims=2) 
-    v_roll_right = torch.roll(v_blocks, shifts=-1, dims=2)
-    v_window = torch.cat([v_roll_left, v_blocks, v_roll_right], dim=3)
-    
-    out_local = torch.matmul(attn_local, v_window) 
-
-    # Add contribution from Global Keys
-    attn_global_cols = F.softmax(global_col_scores * scale, dim=-1)
-    g_v_flat = g_v_blocks.view(b, h, -1, d)
-    out_from_global_keys = torch.einsum("bhnqg, bhgd -> bhnqd", attn_global_cols, g_v_flat)
-    
-    # Combine Local + Global Context
-    final_out = out_local + out_from_global_keys
-
-    # Replace computed local output for Global Blocks with Global Row Output
-    # (Because Global Row saw everything, it's more accurate than Local + Global Col)
-    for i, idx in enumerate(global_indices):
-        final_out[:, :, idx, :, :] = out_global_rows[:, :, i, :, :]
-
-    # Flatten blocks back to sequence
-    return final_out.view(b, h, n, d)
-
+    scale = 1.0 / math.sqrt(Dh)
+    scores = torch.matmul(q_blocks, k_window.transpose(-1, -2)) * scale  # [B,H,nb,B,3B]
+    attn = F.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v_window)  # [B,H,nb,B,Dh]
+    return out.view(B, H, N, Dh)
 
 class BigBirdAttention(nn.Module):
-    """ Main Attention class"""
-    def __init__(self, d_model, num_heads, block_size=64):
+    def __init__(self, d_model, num_heads, block_size=128, dim_key=64, dim_value=64, num_global_tokens=16):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.block_size = block_size
-        self.head_dim = d_model // num_heads
-        
-        # Define the Linear Layers
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.dim_key = dim_key
+        self.dim_value = dim_value
+        self.inner_k = num_heads * dim_key
+        self.inner_v = num_heads * dim_value
+        self.num_global_tokens = num_global_tokens
+
+        self.q_proj = nn.Linear(d_model, self.inner_k, bias=False)
+        self.k_proj = nn.Linear(d_model, self.inner_k, bias=False)
+        self.v_proj = nn.Linear(d_model, self.inner_v, bias=False)
+        self.out_proj = nn.Linear(self.inner_v, d_model)
 
     def forward(self, x, global_indices=None):
-        """ 
-        global_indices: list of block indices that act as hubs.
-        If None, defaults to [0, -1]
-        """
-        batch_size, seq_len, _ = x.shape
-        
-        # Default to First/Last if no indices provided
-        if global_indices is None:
-            num_blocks = seq_len // self.block_size
-            global_indices = [0, num_blocks - 1]
+        # x: [B, G+N, D]
+        B, T, _ = x.shape
+        G = self.num_global_tokens
+        assert T > G
+        xg = x[:, :G, :]   # [B,G,D]
+        xx = x[:, G:, :]   # [B,N,D]
+        N = xx.size(1)
 
-        # Project Q, K, V
-        # Shape: [Batch, Heads, Seq_Len, Head_Dim]
-        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # project combined to avoid extra matmuls?
+        q = self.q_proj(x).view(B, T, self.num_heads, self.dim_key).transpose(1, 2)   # [B,H,T,dk]
+        k = self.k_proj(x).view(B, T, self.num_heads, self.dim_key).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.dim_value).transpose(1, 2)
 
-        # Perform sparse attention
-        context = bigbird_block_sparse_attention(
-            q, k, v, 
-            self.block_size, 
-            global_indices
-        )
+        qg, qx = q[:, :, :G, :], q[:, :, G:, :]   # [B,H,G,dk], [B,H,N,dk]
+        kg, kx = k[:, :, :G, :], k[:, :, G:, :]
+        vg, vx = v[:, :, :G, :], v[:, :, G:, :]
 
-        # Final Projection
-        context = context.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
-        return self.out_proj(context)
+        # local sparse among x tokens
+        out_local_x = local_block_sparse_attention(qx, kx, vx, self.block_size)  # [B,H,N,dv]
+
+        # x attends to globals (read)
+        scale = 1.0 / math.sqrt(self.dim_key)
+        scores_xg = torch.matmul(qx, kg.transpose(-1, -2)) * scale    # [B,H,N,G]
+        attn_xg = F.softmax(scores_xg, dim=-1)
+        out_xg = torch.matmul(attn_xg, vg)                            # [B,H,N,dv]
+
+        out_x = out_local_x + out_xg                                  # [B,H,N,dv]
+
+        # globals attend to x (update)
+        scores_gx = torch.matmul(qg, kx.transpose(-1, -2)) * scale    # [B,H,G,N]
+        attn_gx = F.softmax(scores_gx, dim=-1)
+        out_g = torch.matmul(attn_gx, vx)                             # [B,H,G,dv]
+
+        # concat globals + x so globals persist to next layer
+        out = torch.cat([out_g, out_x], dim=2)                        # [B,H,G+N,dv]
+        out = out.transpose(1, 2).reshape(B, T, self.inner_v)         # [B,T,H*dv]
+        return self.out_proj(out)
 
 class FullAttention(nn.Module):
-    """
-    Standard O(N^2) Attention matching the BigBirdAttention interface.
-    """
-    def __init__(self, d_model, num_heads, block_size=None): 
-        # block_size is unused here but kept for compatibility with BigBird instantiation
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dim_key=64,
+        dim_value=64,
+        dropout=0.,
+        **kwargs 
+    ):
         super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = dim_key ** -0.5
+        self.heads = heads
 
-    def forward(self, x, global_indices=None):
-        # global_indices is ignored in full attention
-        batch_size, seq_len, _ = x.shape
-        
-        # Project Q, K, V
-        # Shape: [Batch, Heads, Seq_Len, Head_Dim]
-        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        self.to_q = nn.Linear(dim, dim_key * heads, bias = False)
+        self.to_k = nn.Linear(dim, dim_key * heads, bias = False)
+        self.to_v = nn.Linear(dim, dim_value * heads, bias = False)
 
-        # Standard Scaled Dot-Product Attention
-        # Scores: [Batch, Heads, Seq_Len, Seq_Len]
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(scores, dim=-1)
-        
-        context = torch.matmul(attn, v)
-        
-        # Final Projection
-        context = context.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
-        return self.out_proj(context)
+        self.to_out = nn.Linear(dim_value * heads, dim)
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        n, h = x.shape[-2], self.heads
+
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+
+        q = q * self.scale
+
+        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k)
+
+        attn = dots.softmax(dim = -1)
+        attn = self.attn_dropout(attn)
+
+        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
