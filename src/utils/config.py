@@ -15,16 +15,18 @@ class EnformerConfig(PretrainedConfig):
         output_heads = dict(human = 5313, mouse= 1643),
         target_length = 896,
         attn_dim_key = 64,
-        block_size = 64,
-        dna_chunk_len = 128,
-        dropout_rate = 0.4,
+        block_size = 128,
+        dna_chunk_len = 384, # Number of Blocks = 1536 / dna_chunk_len
+        num_global_tokens = 16, # should be divisible by block_size
+        dropout_rate = 0.3,
         attn_dropout = 0.05,
         pos_dropout = 0.01,
         use_checkpointing = False,
         use_convnext = False,
-        num_downsamples = 7,    # genetic sequence is downsampled 2 ** 7 == 128x in default Enformer - can be changed for higher resolution
+        num_downsamples = 7,    # genetic sequence is downsampled 2 ** 7 == 128x in default Enformer
         dim_divisible_by = 128,
         use_tf_gamma = False,
+        full_attention = False,
         **kwargs,
     ):
         self.dim = dim
@@ -34,6 +36,7 @@ class EnformerConfig(PretrainedConfig):
         self.target_length = target_length
         self.attn_dim_key = attn_dim_key
         self.block_size = block_size
+        self.num_global_tokens = num_global_tokens
         self.dna_chunk_len = dna_chunk_len
         self.dropout_rate = dropout_rate
         self.attn_dropout = attn_dropout
@@ -42,5 +45,6 @@ class EnformerConfig(PretrainedConfig):
         self.num_downsamples = num_downsamples
         self.dim_divisible_by = dim_divisible_by
         self.use_tf_gamma = use_tf_gamma
+        self.full_attention = full_attention
 
         super().__init__(**kwargs)
