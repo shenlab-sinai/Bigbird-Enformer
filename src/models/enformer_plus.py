@@ -191,80 +191,37 @@ def ConvBlock(dim, dim_out = None, kernel_size = 1, is_distributed = None):
 # Deleted original attention class from enformers and created wrapper class
 # to use BigBirdAttention as a new attention
 
-class PeriodicTokenInjector(nn.Module):
-    def __init__(self, dim, block_size, tokens_per_chunk):
-        """
-        dim: Model dimension (256)
-        block_size: Size of one BigBird block (64)
-        tokens_per_chunk: How often to insert
-        """
+class GlobalTokenInjector(nn.Module):
+    def __init__(self, dim, num_global_tokens):
         super().__init__()
-        self.block_size = block_size
-        self.tokens_per_chunk = tokens_per_chunk
-        
-        # insert a full block of CLS tokens so the shapes align with BigBird
-        # Shape: [1, 1, block_size, dim]
-        self.cls_block = nn.Parameter(torch.randn(1, 1, block_size, dim))
+        self.num_global_tokens = num_global_tokens
+        self.global_tokens = nn.Parameter(torch.randn(1, num_global_tokens, dim))
 
     def forward(self, x):
-        # x: [Batch, Seq_Len, Dim]
-        b, seq_len, d = x.shape
-        
-        # Pad sequence so it is perfectly divisible by tokens_per_chunk
-        remainder = seq_len % self.tokens_per_chunk
-        if remainder > 0:
-            pad_needed = self.tokens_per_chunk - remainder
-            x = F.pad(x, (0, 0, 0, pad_needed))
-            seq_len = x.shape[1]
-            
-        # Reshape into chunks
-        # [Batch, Num_Chunks, Chunk_Len, Dim]
-        num_chunks = seq_len // self.tokens_per_chunk
-        x_reshaped = x.view(b, num_chunks, self.tokens_per_chunk, d)
-        
-        # Expand CLS block to match number of chunks
-        # [Batch, Num_Chunks, Block_Size, Dim]
-        cls_expanded = self.cls_block.expand(b, num_chunks, -1, -1)
-        
-        # Concatenate: Put CLS at the START of every chunk
-        x_with_cls = torch.cat([cls_expanded, x_reshaped], dim=2)
-        
-        return x_with_cls.view(b, -1, d)
+        # x: [B, N, D]
+        b = x.size(0)
+        g = self.global_tokens.expand(b, -1, -1)   # [B, G, D]
+        return torch.cat([g, x], dim=1)            # [B, G+N, D]
 
-class PeriodicTokenRemover(nn.Module):
-    """
-        Remove global cls tokens before the prediction
-    """
-    def __init__(self, block_size, tokens_per_chunk):
+
+class GlobalTokenRemover(nn.Module):
+    def __init__(self, num_global_tokens):
         super().__init__()
-        self.block_size = block_size
-        self.tokens_per_chunk = tokens_per_chunk
+        self.num_global_tokens = num_global_tokens
 
     def forward(self, x):
-        # x: [Batch, Mixed_Seq_Len, Dim]
-        b, seq_len, d = x.shape
-        
-        # Calculate the size of a Mixed Chunk (CLS + DNA)
-        mixed_chunk_len = self.block_size + self.tokens_per_chunk
-        
-        # Reshape to separate CLS from DNA
-        num_chunks = seq_len // mixed_chunk_len
-        x = x.view(b, num_chunks, mixed_chunk_len, d)
-        
-        # Slice off the CLS block and keep only the DNA part
-        x_dna_only = x[:, :, self.block_size:, :]
-        
-        return x_dna_only.contiguous().view(b, -1, d)
-    
+        return x[:, self.num_global_tokens:, :]
+
+
 class BigBirdAutoWrapper(nn.Module):
-    def __init__(self, d_model, num_heads, block_size=64, chunk_size_in_blocks=12):
+    def __init__(self, d_model, num_heads, block_size=64, chunk_size_in_blocks=12, dim_key=64, dim_value=64, num_global_tokens=16):
         """
         Wrapper class that calculates indicies of cls tokens and return BigBirdAttention with those indicies
         chunk_size_in_blocks: Number of DNA in one chunk?
                               If injector used 768 tokens, that is 768/64 = 12 blocks.
         """
         super().__init__()
-        self.layer = BigBirdAttention(d_model, num_heads, block_size)
+        self.layer = BigBirdAttention(d_model, num_heads, block_size, dim_key, dim_value, num_global_tokens)
         self.block_size = block_size
         self.chunk_size_in_blocks = chunk_size_in_blocks
 
@@ -347,10 +304,8 @@ class Enformer(PreTrainedModel):
             if self.use_full_attention:
                 # Use standard O(N^2) Full Attention
                 attn_layer = FullAttention(
-                    d_model=config.dim,
-                    num_heads=config.heads,
-                    # Block size is ignored by FullAttention but passing it doesn't hurt
-                    block_size=self.block_size 
+                    dim=config.dim,
+                    heads=config.heads,
                 )
             else:
                 # Use BigBird Sparse Attention
@@ -358,7 +313,10 @@ class Enformer(PreTrainedModel):
                     d_model=config.dim,
                     num_heads=config.heads,
                     block_size=self.block_size,
-                    chunk_size_in_blocks=dna_blocks_per_chunk 
+                    chunk_size_in_blocks=dna_blocks_per_chunk,
+                    dim_key=config.attn_dim_key,
+                    dim_value=config.attn_dim_key,
+                    num_global_tokens=config.num_global_tokens
                 )
 
 
@@ -397,20 +355,15 @@ class Enformer(PreTrainedModel):
 
         self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
+        G = config.num_global_tokens
+
         if self.use_full_attention:
             self.injector = nn.Identity()
             self.remover = nn.Identity()
         else:
-            self.injector = PeriodicTokenInjector(
-                    dim=config.dim, 
-                    block_size=self.block_size, 
-                    tokens_per_chunk=self.dna_chunk_len
-                )
-            
-            self.remover = PeriodicTokenRemover(
-                    block_size=self.block_size,
-                    tokens_per_chunk=self.dna_chunk_len
-                )
+            self.injector = GlobalTokenInjector(config.dim, G)
+            self.remover  = GlobalTokenRemover(G)
+
         # create trunk sequential module
 
         self._trunk = nn.Sequential(
@@ -459,11 +412,11 @@ class Enformer(PreTrainedModel):
     def trunk_checkpointed(self, x):
         x = rearrange(x, 'b n d -> b d n')
         x = self.stem(x)
-        x = self.conv_tower(x)
+        x = checkpoint_sequential(self.conv_tower, len(self.conv_tower), x, use_reentrant=False)
         x = rearrange(x, 'b d n -> b n d')
         x = self.injector(x)
         x = self.pos_embedding(x)
-        x = checkpoint_sequential(self.transformer, len(self.transformer), x)
+        x = checkpoint_sequential(self.transformer, len(self.transformer), x, use_reentrant=False)
         x = self.remover(x)
         x = self.crop_final(x)
         x = self.final_pointwise(x)
@@ -484,7 +437,7 @@ class Enformer(PreTrainedModel):
 
         elif type(x) == torch.Tensor and x.dtype == torch.long:
             x = seq_indices_to_one_hot(x)
-        x.to(self.device)
+        x = x.to(self.device)
 
         no_batch = x.ndim == 2
 
