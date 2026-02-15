@@ -6,7 +6,7 @@ import pytorch_lightning as pl
 import torch.nn.functional as F
 
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
 from torchmetrics import Metric
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
@@ -38,19 +38,22 @@ class PerformanceMonitor(pl.Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if (trainer.global_step % self.log_every) != 0:
             return
+        if trainer.is_global_zero is False:
+            return  # avoid 8x duplicate logs
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         dt = time.time() - self._t0
 
         local_bs = int(batch["sequence"].shape[0])
-        thr = local_bs / (dt + 1e-8)
+        world = int(trainer.world_size) if hasattr(trainer, "world_size") else 1
 
-        peak_gb = 0.0
-        if torch.cuda.is_available():
-            peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        thr_local = local_bs / (dt + 1e-8)
+        thr_global = thr_local * world
 
-        pl_module.log("perf/throughput_local", thr, on_step=True, prog_bar=True, sync_dist=False)
-        pl_module.log("perf/memory_gb_local", peak_gb, on_step=True, prog_bar=True, sync_dist=False)
+        pl_module.log("perf/throughput_local", thr_local, on_step=True, prog_bar=True, sync_dist=False)
+        pl_module.log("perf/throughput_global", thr_global, on_step=True, prog_bar=True, sync_dist=False)
+
 
 
 def poisson_loss(pred_rate, target):
@@ -118,7 +121,16 @@ class BigBirdLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         seq, target = batch["sequence"], batch["target"]
         pred = self(seq)
+        target = target.to(pred.device, non_blocking=True)
+        if torch.isnan(pred).any():
+            print(f"WARNING: NaN in predictions at step {self.global_step}")
+            return None
+        
         loss = poisson_loss(pred, target)
+        
+        if torch.isnan(loss):
+            print(f"WARNING: NaN loss at step {self.global_step}")
+            return None
 
         self.log("train_loss", loss, on_step=True, on_epoch=False, sync_dist=False, prog_bar=True)
         self.log("train_loss_epoch", loss, on_step=False, on_epoch=True, sync_dist=True, prog_bar=False)
@@ -127,6 +139,7 @@ class BigBirdLightningModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         seq, target = batch["sequence"], batch["target"]
         pred = self(seq)
+        target = target.to(pred.device, non_blocking=True)
         loss = poisson_loss(pred, target)
 
         self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
@@ -138,6 +151,14 @@ class BigBirdLightningModule(pl.LightningModule):
         self.log("val_corr_coef", avg_corr, on_epoch=True, sync_dist=True)
         self.corr_coef.reset()
 
+    def on_before_optimizer_step(self, optimizer):
+        # Log gradient norms
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.parameters(), 
+            max_norm=float('inf')
+        )
+        self.log("train_grad_norm", grad_norm, prog_bar=False)
+
     def configure_optimizers(self):
         total_steps = int(getattr(self.trainer, "estimated_stepping_batches", 60000))
         warmup_steps = min(self.warmup_steps, max(1, total_steps // 2))
@@ -148,7 +169,6 @@ class BigBirdLightningModule(pl.LightningModule):
             weight_decay=self.weight_decay,
             betas=(0.9, 0.999),
             eps=1e-8,
-            fused=True if torch.cuda.is_available() else False,
         )
 
         warmup_scheduler = LinearLR(
@@ -216,22 +236,25 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = False # Set to false to free up memory
+    torch.backends.cudnn.benchmark = True # Set to false to free up memory
 
     config = EnformerConfig(
-        dim=1152,
+        dim=1536,
         depth=11,
         heads=8,
         output_heads=dict(human=5313),
         target_length=896,
         use_checkpointing=True,
-        num_global_tokens=16,
+        num_chunks=4,
+        attention_mode="hierarchical",
+        block_size=64,
+        attn_dropout=0.1,
     )
 
     NPZ_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/human"
-    dm = EnformerDataModule(npz_dir=NPZ_DIR, train_batch_size=8, val_batch_size=2, num_workers=2)
-    model = BigBirdLightningModule(config, lr=3e-4, warmup_steps=2000, weight_decay=1e-4)
-    logger = TensorBoardLogger("tb_logs", name="bigbird_enformer")
+    dm = EnformerDataModule(npz_dir=NPZ_DIR, train_batch_size=8, val_batch_size=8, num_workers=4)
+    model = BigBirdLightningModule(config, lr=5e-4, warmup_steps=5000, weight_decay=1e-7)
+    logger = TensorBoardLogger("tb_logs", name="hierarchical_enformer")
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_corr_coef",
@@ -241,6 +264,13 @@ if __name__ == "__main__":
         save_last=False,
     )
 
+    early_stop_callback = EarlyStopping(
+    monitor="val_corr_coef",
+    patience=10,  
+    mode="max",
+    verbose=True,
+)
+
     lr_monitor = LearningRateMonitor(logging_interval="step")
     perf_monitor = PerformanceMonitor(log_every=50)
 
@@ -249,14 +279,15 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=4,
-        num_nodes=1,
+        num_nodes=2,
         strategy=strategy,
-        max_epochs=50,                    
+        max_epochs=70,                    
         precision="bf16-mixed",
         gradient_clip_val=0.2,              
         gradient_clip_algorithm="norm",
         logger=logger,
-        callbacks=[checkpoint_callback, lr_monitor, perf_monitor],
+        callbacks=[checkpoint_callback, early_stop_callback, lr_monitor, perf_monitor],
+        #callbacks=[early_stop_callback, lr_monitor, perf_monitor],
         sync_batchnorm=False,
         accumulate_grad_batches=2,          
         log_every_n_steps=10,

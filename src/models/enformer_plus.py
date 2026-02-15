@@ -34,7 +34,7 @@ from einops.layers.torch import Rearrange
 
 from src.utils.data import str_to_one_hot, seq_indices_to_one_hot
 from src.utils.config import EnformerConfig
-from src.layers.attention import BigBirdAttention, FullAttention
+from src.layers.attention import BigBirdAttention, FullAttention, HierarchicalAttention
 
 from transformers import PreTrainedModel
 
@@ -164,19 +164,15 @@ class TargetLengthCrop(nn.Module):
 
     def forward(self, x):
         seq_len, target_len = x.shape[-2], self.target_length
-
         if target_len == -1:
             return x
-
         if seq_len < target_len:
             raise ValueError(f'sequence length {seq_len} is less than target length {target_len}')
 
-        trim = (target_len - seq_len) // 2
+        start = (seq_len - target_len) // 2
+        end = start + target_len
+        return x[:, start:end, :]
 
-        if trim == 0:
-            return x
-
-        return x[:, -trim:trim]
 
 def ConvBlock(dim, dim_out = None, kernel_size = 1, is_distributed = None):
     batchnorm_klass = MaybeSyncBatchnorm(is_distributed = is_distributed)
@@ -191,55 +187,140 @@ def ConvBlock(dim, dim_out = None, kernel_size = 1, is_distributed = None):
 # Deleted original attention class from enformers and created wrapper class
 # to use BigBirdAttention as a new attention
 
-class GlobalTokenInjector(nn.Module):
-    def __init__(self, dim, num_global_tokens):
-        super().__init__()
-        self.num_global_tokens = num_global_tokens
-        self.global_tokens = nn.Parameter(torch.randn(1, num_global_tokens, dim))
+class ChunkGlobalTokenInjector(nn.Module):
+    """
+    Inserts C learnable globals interleaved with C equal chunks:
 
-    def forward(self, x):
-        # x: [B, N, D]
-        b = x.size(0)
-        g = self.global_tokens.expand(b, -1, -1)   # [B, G, D]
-        return torch.cat([g, x], dim=1)            # [B, G+N, D]
+      x (B,N,D) -> [g0, x0, g1, x1, ..., g(C-1), x(C-1)]
+
+    where N must be divisible by C, and xi has length N/C.
+    """
+    def __init__(self, dim: int, num_chunks: int, init_std: float = 0.02):
+        super().__init__()
+        assert num_chunks >= 1
+        self.num_chunks = int(num_chunks)
+
+        self.g = nn.Parameter(torch.zeros(1, self.num_chunks, 1, dim))
+        nn.init.normal_(self.g, std=init_std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        C = self.num_chunks
+        assert N % C == 0, f"Local sequence length N={N} must be divisible by num_chunks C={C}"
+        n_chunk = N // C
+
+        x_chunks = x.view(B, C, n_chunk, D)
+        g = self.g.expand(B, -1, -1, -1)
+        interleaved = torch.cat([g, x_chunks], dim=2)
+
+        return interleaved.reshape(B, C * (1 + n_chunk), D)
+
+
+class ChunkGlobalTokenRemover(nn.Module):
+    """
+    Removes interleaved globals:
+
+      [g0, x0, g1, x1, ..., g(C-1), x(C-1)] -> [x0, x1, ..., x(C-1)]
+    """
+    def __init__(self, num_chunks: int):
+        super().__init__()
+        assert num_chunks >= 1
+        self.num_chunks = int(num_chunks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        C = self.num_chunks
+
+        assert T % C == 0, f"T={T} must be divisible by num_chunks C={C}"
+        stride = T // C                 # = 1 + n_chunk
+        assert stride >= 2, f"Need at least 1 global + 1 local per chunk. Got stride={stride}"
+        x = x.view(B, C, stride, D)
+        x_locals = x[:, :, 1:, :]       # [B, C, n_chunk, D]
+
+        return x_locals.reshape(B, C * (stride - 1), D)
+
+class GlobalTokenInjector(nn.Module):
+    """
+    Inserts 2 learnable globals into the middle:
+      x -> [g1] + x[:mid] + [g2] + x[mid:]
+    where mid = N//2
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.g1 = nn.Parameter(torch.zeros(1, 1, dim))
+        self.g2 = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.normal_(self.g1, std=0.02)
+        nn.init.normal_(self.g2, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        assert N % 2 == 0, f"Local sequence length must be even for 2 chunks. Got N={N}"
+        mid = N // 2
+        g1 = self.g1.expand(B, -1, -1)
+        g2 = self.g2.expand(B, -1, -1)
+        return torch.cat([g1, x[:, :mid, :], g2, x[:, mid:, :]], dim=1)
 
 
 class GlobalTokenRemover(nn.Module):
-    def __init__(self, num_global_tokens):
-        super().__init__()
-        self.num_global_tokens = num_global_tokens
-
-    def forward(self, x):
-        return x[:, self.num_global_tokens:, :]
+    """
+    Removes the 2 globals from:
+      [g1, chunk1, g2, chunk2] -> [chunk1, chunk2]
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        N = T - 2
+        assert N % 2 == 0, f"(T-2) must be even. Got T={T}"
+        mid = N // 2
+        chunk1 = x[:, 1:(1 + mid), :]
+        chunk2 = x[:, (2 + mid):, :]
+        return torch.cat([chunk1, chunk2], dim=1)
 
 
 class BigBirdAutoWrapper(nn.Module):
-    def __init__(self, d_model, num_heads, block_size=64, chunk_size_in_blocks=12, dim_key=64, dim_value=64, num_global_tokens=16):
-        """
-        Wrapper class that calculates indicies of cls tokens and return BigBirdAttention with those indicies
-        chunk_size_in_blocks: Number of DNA in one chunk?
-                              If injector used 768 tokens, that is 768/64 = 12 blocks.
-        """
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        block_size=128,
+        dim_key=64,
+        dim_value=64,
+        num_chunks=2,
+        num_global_tokens=2,
+        attn_dropout=0.0,
+        local_window_blocks=3,
+        layer_idx=0,
+        attention_mode="sparse_3",
+    ):
         super().__init__()
-        self.layer = BigBirdAttention(d_model, num_heads, block_size, dim_key, dim_value, num_global_tokens)
-        self.block_size = block_size
-        self.chunk_size_in_blocks = chunk_size_in_blocks
+
+        if attention_mode == "hierarchical":
+            self.layer = HierarchicalAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_chunks=num_chunks,
+                block_size=block_size,
+                dim_key=dim_key,
+                dim_value=dim_value,
+                attn_dropout=attn_dropout,
+                local_window_blocks=local_window_blocks,
+                layer_idx=layer_idx,
+            )
+        else:
+            self.layer = BigBirdAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                block_size=block_size,
+                dim_key=dim_key,
+                dim_value=dim_value,
+                num_global_tokens=num_global_tokens,
+                attn_dropout=attn_dropout,
+                local_window_blocks=local_window_blocks,
+                layer_idx=layer_idx,
+            )
 
     def forward(self, x):
-        # x already has CLS tokens inserted.
-        # The structure is: [CLS_Block, DNA_Block_1...DNA_Block_12, CLS_Block, ...]
-        
-        # The period is: 1 global block + N dna blocks
-        period = 1 + self.chunk_size_in_blocks
-        
-        seq_len = x.shape[1]
-        num_blocks = seq_len // self.block_size
-        
-        # Calculate indices: 0, 13, 26, 39...
-        global_indices = [i for i in range(0, num_blocks, period)]
-        
-        return self.layer(x, global_indices=global_indices)
-    
+        return self.layer(x)
+
 # main class with BigBirdAttention
 
 class Enformer(PreTrainedModel):
@@ -262,7 +343,21 @@ class Enformer(PreTrainedModel):
 
         # create stem
 
-        self.use_full_attention = getattr(config, 'full_attention', False)
+        self.attention_mode = getattr(config, "attention_mode", "sparse_3")
+        assert self.attention_mode in ("full", "sparse_2", "sparse_3", "hierarchical"), \
+            f"Invalid attention_mode={self.attention_mode}"
+
+        self.use_full_attention = (self.attention_mode == "full")
+
+        if self.attention_mode == "full":
+            self.local_window_blocks = None
+        elif self.attention_mode == "sparse_2":
+            self.local_window_blocks = 2
+        elif self.attention_mode == "sparse_3":
+            self.local_window_blocks = 3
+        elif self.attention_mode == "hierarchical":
+            # self.local_window_blocks = getattr(config, "local_window_blocks", 2)  # or 3
+            self.local_window_blocks = 3
 
         self.stem = nn.Sequential(
             nn.Conv1d(4, half_dim, 15, padding = 7),
@@ -299,24 +394,25 @@ class Enformer(PreTrainedModel):
         # transformer
 
         transformer = []
-        for _ in range(config.depth):
-
+        for layer_idx in range(config.depth):
             if self.use_full_attention:
-                # Use standard O(N^2) Full Attention
                 attn_layer = FullAttention(
                     dim=config.dim,
                     heads=config.heads,
                 )
             else:
-                # Use BigBird Sparse Attention
                 attn_layer = BigBirdAutoWrapper(
                     d_model=config.dim,
                     num_heads=config.heads,
                     block_size=self.block_size,
-                    chunk_size_in_blocks=dna_blocks_per_chunk,
                     dim_key=config.attn_dim_key,
                     dim_value=config.attn_dim_key,
-                    num_global_tokens=config.num_global_tokens
+                    num_chunks=getattr(config, "num_chunks", 2),
+                    num_global_tokens=config.num_global_tokens,
+                    attn_dropout=config.attn_dropout,
+                    local_window_blocks=self.local_window_blocks,
+                    layer_idx=layer_idx,
+                    attention_mode=self.attention_mode, 
                 )
 
 
@@ -355,14 +451,19 @@ class Enformer(PreTrainedModel):
 
         self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
-        G = config.num_global_tokens
+        G = int(getattr(config, "num_global_tokens", 2))
 
         if self.use_full_attention:
             self.injector = nn.Identity()
             self.remover = nn.Identity()
+        elif self.attention_mode == "hierarchical":
+            C = int(getattr(config, "num_chunks", 2))
+            self.injector = ChunkGlobalTokenInjector(config.dim, num_chunks=C)
+            self.remover  = ChunkGlobalTokenRemover(num_chunks=C)
         else:
-            self.injector = GlobalTokenInjector(config.dim, G)
-            self.remover  = GlobalTokenRemover(G)
+            assert G == 2, f"For front+end globals, num_global_tokens must be 2, got {G}"
+            self.injector = GlobalTokenInjector(config.dim)   
+            self.remover  = GlobalTokenRemover()             
 
         # create trunk sequential module
 
