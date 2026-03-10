@@ -1,462 +1,222 @@
 # src/layers/attention.py
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# 
-# local sparse helpers (2-block and 3-block)
-# 
-
-def _edge_mask_2(nb: int, B: int, device: torch.device, window_dir: str):
-    """
-    mask: [1,1,nb,1,2B], True means invalid positions
-    window_dir:
-      - "left" : [left, current]  -> first block's left half is padding
-      - "right": [current, right] -> last  block's right half is padding
-    """
-    m = torch.zeros((nb, 2 * B), device=device, dtype=torch.bool)
-    if window_dir == "left":
-        m[0, :B] = True
-    elif window_dir == "right":
-        m[-1, B:] = True
-    else:
-        raise ValueError(f"window_dir must be 'left' or 'right', got {window_dir}")
-    return m.view(1, 1, nb, 1, 2 * B)
-
-
-def _edge_mask_3(nb: int, B: int, device: torch.device):
-    """
-    mask: [1,1,nb,1,3B]
-    window = [left, current, right]
-      - first block: left part invalid
-      - last  block: right part invalid
-    """
-    m = torch.zeros((nb, 3 * B), device=device, dtype=torch.bool)
-    m[0, :B] = True
-    m[-1, 2 * B:] = True
-    return m.view(1, 1, nb, 1, 3 * B)
-
-
-def local_sparse_2block(
-    q, k, v,
-    block_size: int,
-    window_dir: str,                 # "left" or "right"
-    attn_dropout_p: float = 0.0,
-    training: bool = True,
-):
-    """
-    2-block local sparse:
-      window_dir="left"  -> [left, current]
-      window_dir="right" -> [current, right]
-    q,k: [B,H,N,Dk], v: [B,H,N,Dv]
-    """
-    b, h, n, dk = q.shape
-    assert n % block_size == 0, f"N={n} must be divisible by block_size={block_size}"
-    nb = n // block_size
-    B = block_size
-    dv = v.shape[-1]
-
-    q_blocks = q.reshape(b, h, nb, B, dk)
-    k_blocks = k.reshape(b, h, nb, B, dk)
-    v_blocks = v.reshape(b, h, nb, B, dv)
-
-    # pad with zeros at both ends (no wrap)
-    z_k = torch.zeros_like(k_blocks[:, :, :1])
-    z_v = torch.zeros_like(v_blocks[:, :, :1])
-    k_pad = torch.cat([z_k, k_blocks, z_k], dim=2)  # [b,h,nb+2,B,dk]
-    v_pad = torch.cat([z_v, v_blocks, z_v], dim=2)  # [b,h,nb+2,B,dv]
-
-    if window_dir == "left":
-        k_a = k_pad[:, :, 0:nb]
-        k_b = k_pad[:, :, 1:nb+1]
-        v_a = v_pad[:, :, 0:nb]
-        v_b = v_pad[:, :, 1:nb+1]
-    elif window_dir == "right":
-        k_a = k_pad[:, :, 1:nb+1]
-        k_b = k_pad[:, :, 2:nb+2]
-        v_a = v_pad[:, :, 1:nb+1]
-        v_b = v_pad[:, :, 2:nb+2]
-    else:
-        raise ValueError(f"window_dir must be 'left' or 'right', got {window_dir}")
-
-    k_window = torch.cat([k_a, k_b], dim=3)  # [b,h,nb,2B,dk]
-    v_window = torch.cat([v_a, v_b], dim=3)  # [b,h,nb,2B,dv]
-
-    scale = 1.0 / math.sqrt(dk)
-    scores = torch.matmul(q_blocks.float(), k_window.float().transpose(-1, -2)) * scale  # [b,h,nb,B,2B]
-
-    # mask padded half-window at edges
-    scores = scores.masked_fill(_edge_mask_2(nb, B, q.device, window_dir), float("-inf"))
-
-    attn = torch.softmax(scores, dim=-1).to(v.dtype)
-    if attn_dropout_p > 0.0:
-        attn = F.dropout(attn, p=attn_dropout_p, training=training)
-
-    out = torch.matmul(attn, v_window)  # [b,h,nb,B,dv]
-    return out.reshape(b, h, n, dv)
-
-def local_sparse_3block(q, k, v, block_size, attn_dropout_p=0.0, training=True):
-    """
-    Zero-copy implementation using as_strided.
-    """
-    b, h, n, dk = q.shape
-    dv = v.shape[-1]
-    nb = n // block_size
-    B = block_size
-
-    # 1. View as blocks [b, h, nb, B, d]
-    q_blocks = q.view(b, h, nb, B, dk)
-    k_blocks = k.view(b, h, nb, B, dk)
-    v_blocks = v.view(b, h, nb, B, dv)
-
-    # 2. Pad K and V for the windows (allocates small memory)
-    # We need 1 block padding on left and right
-    z_k = torch.zeros(b, h, 1, B, dk, device=k.device, dtype=k.dtype)
-    z_v = torch.zeros(b, h, 1, B, dv, device=v.device, dtype=v.dtype)
-    
-    # We must concatenate ONCE to create the padded canvas
-    k_pad = torch.cat([z_k, k_blocks, z_k], dim=2) 
-    v_pad = torch.cat([z_v, v_blocks, z_v], dim=2)
-
-    s_b, s_h, s_nb, s_B, s_d = k_pad.stride()
-
-    k_unfolded = k_pad.unfold(dimension=2, size=3, step=1) # [b, h, nb, B, dk, 3]
-    v_unfolded = v_pad.unfold(dimension=2, size=3, step=1)
-    
-    k_window = k_unfolded.permute(0, 1, 2, 5, 3, 4).reshape(b, h, nb, 3*B, dk)
-    v_window = v_unfolded.permute(0, 1, 2, 5, 3, 4).reshape(b, h, nb, 3*B, dv)
-
-    scale = 1.0 / math.sqrt(dk)
-    scores = torch.matmul(q_blocks, k_window.transpose(-1, -2)) * scale
-    
-    scores = scores.masked_fill(_edge_mask_3(nb, B, q.device), float("-inf"))
-    
-    attn = torch.softmax(scores, dim=-1)
-    if attn_dropout_p > 0.0:
-        attn = F.dropout(attn, p=attn_dropout_p, training=training)
-        
-    out = torch.matmul(attn, v_window)
-    return out.reshape(b, h, n, dv)
-
-
-class HierarchicalAttention(nn.Module):
-    """
-    Layout: [g0, chunk0..., g1, chunk1..., ..., g(C-1), chunk(C-1)...]
-    Optimized to avoid OOM by removing redundant tensor concatenations.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        num_chunks: int,
-        block_size: int = 128,
-        dim_key: int = 64,
-        dim_value: int = 64,
-        attn_dropout: float = 0.0,
-        local_window_blocks: int = 3,
-        layer_idx: int = 0,
-    ):
-        super().__init__()
-        assert num_chunks >= 1
-        assert local_window_blocks in (2, 3)
-
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.num_chunks = int(num_chunks)
-        self.block_size = block_size
-        self.dim_key = dim_key
-        self.dim_value = dim_value
-        self.inner_k = num_heads * dim_key
-        self.inner_v = num_heads * dim_value
-        self.attn_dropout_p = float(attn_dropout)
-        self.local_window_blocks = int(local_window_blocks)
-        self.layer_idx = int(layer_idx)
-
-        # For sparse_2 alternate direction
-        if self.local_window_blocks == 2:
-            self.window_dir = "left" if (self.layer_idx % 2 == 0) else "right"
-        else:
-            self.window_dir = None
-
-        self.q_proj = nn.Linear(d_model, self.inner_k, bias=False)
-        self.k_proj = nn.Linear(d_model, self.inner_k, bias=False)
-        self.v_proj = nn.Linear(d_model, self.inner_v, bias=False)
-        self.out_proj = nn.Linear(self.inner_v, d_model)
-
-    def _softmax_fp32(self, scores: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        attn = torch.softmax(scores, dim=dim, dtype=torch.float32)
-        return attn.to(scores.dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, _ = x.shape
-        H = self.num_heads
-        dk = self.dim_key
-        dv = self.dim_value
-        C = self.num_chunks
-
-        assert T > C
-        N = T - C
-        Nchunk = N // C
-        
-        scale = 1.0 / math.sqrt(dk)
-
-        q = self.q_proj(x).view(B, T, H, dk).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, H, dk).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, H, dv).transpose(1, 2)
-
-        # --- 1. Slice Interleaved Layout ---
-        stride = Nchunk + 1
-        g_idx = torch.arange(0, C * stride, stride, device=x.device)
-        
-        # Globals: [B,H,C,1,dk]
-        gq = q.index_select(dim=2, index=g_idx).unsqueeze(3)
-        gk = k.index_select(dim=2, index=g_idx).unsqueeze(3)
-        gv = v.index_select(dim=2, index=g_idx).unsqueeze(3)
-
-        # Locals: [B,H,C*Nchunk,dk]
-        base = g_idx + 1
-        offsets = torch.arange(0, Nchunk, device=x.device)
-        local_idx = (base[:, None] + offsets[None, :]).reshape(-1)
-        
-        qx = q.index_select(dim=2, index=local_idx)
-        kx = k.index_select(dim=2, index=local_idx)
-        vx = v.index_select(dim=2, index=local_idx)
-
-        # Reshape locals to chunked form: [B,H,C,Nchunk,dk]
-        qx = qx.view(B, H, C, Nchunk, dk)
-        kx = kx.view(B, H, C, Nchunk, dk)
-        vx = vx.view(B, H, C, Nchunk, dv)
-
-        # --- 2. Local Sparse Attention (Optimized) ---
-        # Flatten chunks into batch -> [B*C, H, Nchunk, dk]
-        q_flat = qx.permute(0, 2, 1, 3, 4).reshape(B * C, H, Nchunk, dk)
-        k_flat = kx.permute(0, 2, 1, 3, 4).reshape(B * C, H, Nchunk, dk)
-        v_flat = vx.permute(0, 2, 1, 3, 4).reshape(B * C, H, Nchunk, dv)
-
-        if self.local_window_blocks == 3:
-            # Use the new zero-copy optimized function
-            out_local_flat = local_sparse_3block(
-                q_flat, k_flat, v_flat,
-                block_size=self.block_size,
-                attn_dropout_p=self.attn_dropout_p,
-                training=self.training,
-            )
-        else:
-            # Keep existing 2-block or write a similar optimized version
-            out_local_flat = local_sparse_2block(
-                q_flat, k_flat, v_flat,
-                block_size=self.block_size,
-                window_dir=self.window_dir,
-                attn_dropout_p=self.attn_dropout_p,
-                training=self.training,
-            )
-
-        out_local = out_local_flat.view(B, C, H, Nchunk, dv).permute(0, 2, 1, 3, 4)
-
-        # --- 3. Global Mixing (Optimized Split Calculation) ---
-        
-        # Locals attend to their own global
-        # Simple addition to local output
-        out_xg = gv.expand(-1, -1, -1, Nchunk, -1)
-        if self.attn_dropout_p > 0.0:
-            out_xg = F.dropout(out_xg, p=self.attn_dropout_p, training=self.training)
-        out_chunks = out_local + out_xg
-
-        # Globals attend to [All Globals] + [Own Chunk Locals]
-        # We split this calculation to avoid concatenating huge K/V tensors
-        
-        # 3a. Global <-> Global scores [B,H,C,1,C]
-        # We need all globals (gk_all) against each specific global
-        gk_all = gk.squeeze(3) # [B,H,C,dk]
-        gv_all = gv.squeeze(3)
-        # Replicate for broadcast: [B,H,C,C,dk]
-        gk_rep = gk_all.unsqueeze(2).expand(-1, -1, C, -1, -1)
-        gv_rep = gv_all.unsqueeze(2).expand(-1, -1, C, -1, -1)
-        
-        scores_g_g = torch.matmul(gq, gk_rep.transpose(-1, -2)) * scale
-        
-        # 3b. Global <-> Chunk Local scores [B,H,C,1,Nchunk]
-        # kx is [B,H,C,Nchunk,dk]
-        scores_g_l = torch.matmul(gq, kx.transpose(-1, -2)) * scale
-        
-        # 3c. Concat SCORES only (Memory Safe)
-        # Result: [B,H,C,1, C + Nchunk]
-        scores_combined = torch.cat([scores_g_g, scores_g_l], dim=-1)
-        
-        attn_combined = self._softmax_fp32(scores_combined, dim=-1)
-        if self.attn_dropout_p > 0.0:
-            attn_combined = F.dropout(attn_combined, p=self.attn_dropout_p, training=self.training)
-            
-        # 3d. Weighted Sum
-        # Split weights back
-        attn_g_g = attn_combined[..., :C]      # [B,H,C,1,C]
-        attn_g_l = attn_combined[..., C:]      # [B,H,C,1,Nchunk]
-        
-        out_g_g = torch.matmul(attn_g_g, gv_rep) # [B,H,C,1,dv]
-        out_g_l = torch.matmul(attn_g_l, vx)     # [B,H,C,1,dv]
-        
-        out_g = out_g_g + out_g_l
-
-        # --- 4. Final Reassembly ---
-        out_interleaved = torch.cat([out_g, out_chunks], dim=3)
-        out = out_interleaved.reshape(B, H, C * (1 + Nchunk), dv)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.inner_v)
-        
-        return self.out_proj(out)
-
 class BigBirdAttention(nn.Module):
     def __init__(
         self,
-        d_model: int,
-        num_heads: int,
-        block_size: int = 128,
+        dim: int,
+        heads: int = 8,
         dim_key: int = 64,
         dim_value: int = 64,
-        num_global_tokens: int = 2,
-        attn_dropout: float = 0.0,
-
-        # new knobs (safe defaults)
-        local_window_blocks: int = 3,   # 2 => sparse_2, 3 => sparse_3
-        layer_idx: int = 0,             # used only when local_window_blocks=2
+        block_size: int = 128,
+        dropout: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
-        assert local_window_blocks in (2, 3), f"local_window_blocks must be 2 or 3, got {local_window_blocks}"
-
-        self.d_model = d_model
-        self.num_heads = num_heads
+        self.heads      = heads
+        self.dim_key    = dim_key
+        self.dim_value  = dim_value
         self.block_size = block_size
-        self.dim_key = dim_key
-        self.dim_value = dim_value
-        self.inner_k = num_heads * dim_key
-        self.inner_v = num_heads * dim_value
-        self.num_global_tokens = int(num_global_tokens)
-        self.attn_dropout_p = float(attn_dropout)
+        self.dropout_p  = float(dropout)
 
-        self.local_window_blocks = int(local_window_blocks)
-        self.layer_idx = int(layer_idx)
+        self.inner_k = heads * dim_key
+        self.inner_v = heads * dim_value
 
-        # for sparse_2 alternate direction, always starting from LEFT
-        if self.local_window_blocks == 2:
-            self.window_dir = "left" if (self.layer_idx % 2 == 0) else "right"
-        else:
-            self.window_dir = None
-
-        self.q_proj = nn.Linear(d_model, self.inner_k, bias=False)
-        self.k_proj = nn.Linear(d_model, self.inner_k, bias=False)
-        self.v_proj = nn.Linear(d_model, self.inner_v, bias=False)
-        self.out_proj = nn.Linear(self.inner_v, d_model)
+        self.to_q   = nn.Linear(dim, self.inner_k, bias=False)
+        self.to_k   = nn.Linear(dim, self.inner_k, bias=False)
+        self.to_v   = nn.Linear(dim, self.inner_v, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
-        H = self.num_heads
+        H  = self.heads
+        dk = self.dim_key
+        dv = self.dim_value
+        BS = self.block_size
+        N  = T - 1          # number of local tokens
+        nb = N // BS        # number of local blocks
+        drop = self.dropout_p if self.training else 0.0
 
-        assert self.num_global_tokens == 2, (
-            f"This attention assumes exactly 2 globals (front+end). Got {self.num_global_tokens}"
+        assert N % BS == 0, (
+            f"Local length N={N} (= seq_len-1) must be divisible by block_size={BS}"
         )
-        assert T >= 3, f"Need at least 2 globals + 1 local. Got T={T}"
 
-        scale = 1.0 / math.sqrt(self.dim_key)
+        q = self.to_q(x).view(B, T, H, dk).transpose(1, 2) 
+        k = self.to_k(x).view(B, T, H, dk).transpose(1, 2)
+        v = self.to_v(x).view(B, T, H, dv).transpose(1, 2)
 
-        q = self.q_proj(x).view(B, T, H, self.dim_key).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, H, self.dim_key).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, H, self.dim_value).transpose(1, 2)
+        kg = k[:, :, :1, :]   
+        vg = v[:, :, :1, :]  
+        kx = k[:, :, 1:, :]  
+        vx = v[:, :, 1:, :]  
 
-        # 2 globals: front and end
-        qg = torch.cat([q[:, :, 0:1], q[:, :, -1:]], dim=2)  # [B,H,2,Dk]
-        kg = torch.cat([k[:, :, 0:1], k[:, :, -1:]], dim=2)  # [B,H,2,Dk]
-        vg = torch.cat([v[:, :, 0:1], v[:, :, -1:]], dim=2)  # [B,H,2,Dv]
+        # Global token
+        out_g = F.scaled_dot_product_attention(
+            q[:, :, :1, :], k, v, dropout_p=drop, is_causal=False
+        ) 
 
-        # locals
-        qx = q[:, :, 1:-1]
-        kx = k[:, :, 1:-1]
-        vx = v[:, :, 1:-1]
+        # Local blocks
+        qx_blk = q[:, :, 1:, :].view(B, H, nb, BS, dk)
+        kx_blk = kx.view(B, H, nb, BS, dk)
+        vx_blk = vx.view(B, H, nb, BS, dv)
 
-        N = T - 2
-        assert N % self.block_size == 0, f"Local N must be divisible by block_size. N={N}, block_size={self.block_size}"
+        zk = kx.new_zeros(B, H, 1, BS, dk)
+        zv = vx.new_zeros(B, H, 1, BS, dv)
+        kx_pad = torch.cat([zk, kx_blk, zk], dim=2)  
+        vx_pad = torch.cat([zv, vx_blk, zv], dim=2)
 
-        # local sparse
-        if self.local_window_blocks == 2:
-            out_local = local_sparse_2block(
-                qx, kx, vx,
-                block_size=self.block_size,
-                window_dir=self.window_dir,
-                attn_dropout_p=self.attn_dropout_p,
-                training=self.training,
-            )
-        else:
-            out_local = local_sparse_3block(
-                qx, kx, vx,
-                block_size=self.block_size,
-                attn_dropout_p=self.attn_dropout_p,
-                training=self.training,
-            )
+        k_local = torch.cat(
+            [kx_pad[:, :, 0:nb], kx_pad[:, :, 1:nb+1], kx_pad[:, :, 2:nb+2]], dim=3
+        )
+        v_local = torch.cat(
+            [vx_pad[:, :, 0:nb], vx_pad[:, :, 1:nb+1], vx_pad[:, :, 2:nb+2]], dim=3
+        )
 
-        # locals attend to globals
-        scores_xg = torch.matmul(qx, kg.transpose(-1, -2)) * scale  # [B,H,N,2]
-        attn_xg = torch.softmax(scores_xg, dim=-1)
-        if self.attn_dropout_p > 0.0:
-            attn_xg = F.dropout(attn_xg, p=self.attn_dropout_p, training=self.training)
-        out_xg = torch.matmul(attn_xg, vg)  # [B,H,N,Dv]
+        # Prepend global token to every block
+        kg_exp = kg.unsqueeze(2).expand(-1, -1, nb, -1, -1)
+        vg_exp = vg.unsqueeze(2).expand(-1, -1, nb, -1, -1)
+        k_full = torch.cat([kg_exp, k_local], dim=3)
+        v_full = torch.cat([vg_exp, v_local], dim=3)
 
-        out_x = out_local + out_xg
+        # Flatten (B, nb)
+        q_flat = qx_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,          dk)
+        k_flat = k_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS,  dk)
+        v_flat = v_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS,  dv)
 
-        # globals attend to (globals + locals) => includes global<->global
-        k_for_g = torch.cat([kg, kx], dim=2)  # [B,H,2+N,Dk]
-        v_for_g = torch.cat([vg, vx], dim=2)  # [B,H,2+N,Dv]
+        # FlashAttention
+        out_flat = F.scaled_dot_product_attention(
+            q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False
+        ) 
 
-        scores_g = torch.matmul(qg, k_for_g.transpose(-1, -2)) * scale  # [B,H,2,2+N]
-        attn_g = torch.softmax(scores_g, dim=-1)
-        if self.attn_dropout_p > 0.0:
-            attn_g = F.dropout(attn_g, p=self.attn_dropout_p, training=self.training)
-        out_g = torch.matmul(attn_g, v_for_g)  # [B,H,2,Dv]
+        out_x = out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
 
-        out_front, out_end = out_g[:, :, 0:1], out_g[:, :, 1:2]
-        out = torch.cat([out_front, out_x, out_end], dim=2)  # [B,H,T,Dv]
-
+        # Reassemble
+        out = torch.cat([out_g, out_x], dim=2)           
         out = out.transpose(1, 2).contiguous().view(B, T, self.inner_v)
-        return self.out_proj(out)
+        return self.to_out(out)
 
+
+class BlockSparseAttention(nn.Module):
+    """
+    Block Sparse Attention with Global Tokens.
+
+    Structure: [Global, Local_1, Local_2, ..., Local_N] per block.
+
+    Input: [Batch, SeqLen, Dim]
+           SeqLen must be divisible by block_size.
+           (block_size should include the global token, e.g. 128 local + 1 global = 129).
+    """
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        block_size: int = 129,
+        dim_key: int = 64,
+        dim_value: int = 64,
+        dropout: float = 0.0,
+        **kwargs
+    ):
+        super().__init__()
+        self.heads = heads
+        self.block_size = block_size
+        self.dim_key = dim_key
+        self.dim_value = dim_value
+        self.dropout_p = float(dropout)
+
+        self.inner_k = heads * dim_key
+        self.inner_v = heads * dim_value
+
+        self.to_q = nn.Linear(dim, self.inner_k, bias=False)
+        self.to_k = nn.Linear(dim, self.inner_k, bias=False)
+        self.to_v = nn.Linear(dim, self.inner_v, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H = self.heads
+        BLK = self.block_size
+
+        assert N % BLK == 0, f"Sequence length {N} must be divisible by block_size {BLK}"
+        num_blocks = N // BLK
+
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        q_blk_view = q.view(B, num_blocks, BLK, H, self.dim_key)
+        k_blk_view = k.view(B, num_blocks, BLK, H, self.dim_key)
+        v_blk_view = v.view(B, num_blocks, BLK, H, self.dim_value)
+
+        # Intra-block attention
+        q_blk = q_blk_view.reshape(B * num_blocks, BLK, H, self.dim_key).transpose(1, 2)
+        k_blk = k_blk_view.reshape(B * num_blocks, BLK, H, self.dim_key).transpose(1, 2)
+        v_blk = v_blk_view.reshape(B * num_blocks, BLK, H, self.dim_value).transpose(1, 2)
+
+        out_blk = F.scaled_dot_product_attention(
+            q_blk, k_blk, v_blk,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        ) 
+
+        out_blk = out_blk.view(B, num_blocks, H, BLK, self.dim_value)
+
+        # Global-Global attention 
+        q_g = q_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
+        k_g = k_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
+        v_g = v_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
+
+        out_g = F.scaled_dot_product_attention(
+            q_g, k_g, v_g,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
+
+        # Combine 
+        out_g_reshaped = out_g.permute(0, 2, 1, 3).unsqueeze(3)
+        global_part = out_blk[:, :, :, 0:1, :] + out_g_reshaped
+        local_part  = out_blk[:, :, :, 1:,  :]
+
+        out_combined = torch.cat([global_part, local_part], dim=3)
+        out_combined = out_combined.permute(0, 1, 3, 2, 4).reshape(B, N, self.inner_v)
+        return self.to_out(out_combined)
 
 
 class FullAttention(nn.Module):
     """
-    Standard O(N^2) attention using plain matrix multiplication.
+    Standard Full Attention (FlashAttention via SDPA).
     """
-    def __init__(self, dim, heads=8, dim_key=64, dim_value=64, dropout=0.05, **kwargs):
+    def __init__(self, dim, heads=8, dim_key=64, dim_value=64, dropout=0.0, **kwargs):
         super().__init__()
         self.heads = heads
         self.dim_key = dim_key
         self.dim_value = dim_value
         self.dropout_p = float(dropout)
 
-        self.to_q = nn.Linear(dim, dim_key * heads, bias=False)
-        self.to_k = nn.Linear(dim, dim_key * heads, bias=False)
-        self.to_v = nn.Linear(dim, dim_value * heads, bias=False)
+        self.inner_k = heads * dim_key
+        self.inner_v = heads * dim_value
 
-        self.to_out = nn.Linear(dim_value * heads, dim)
-        
+        self.to_q = nn.Linear(dim, self.inner_k, bias=False)
+        self.to_k = nn.Linear(dim, self.inner_k, bias=False)
+        self.to_v = nn.Linear(dim, self.inner_v, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
+
     def forward(self, x):
         B, N, _ = x.shape
-        h = self.heads
-        
-        q = self.to_q(x).view(B, N, h, self.dim_key).transpose(1, 2)
-        k = self.to_k(x).view(B, N, h, self.dim_key).transpose(1, 2)
-        v = self.to_v(x).view(B, N, h, self.dim_value).transpose(1, 2)
+        H = self.heads
 
-        scale = 1.0 / math.sqrt(self.dim_key)
+        q = self.to_q(x).view(B, N, H, self.dim_key).transpose(1, 2)
+        k = self.to_k(x).view(B, N, H, self.dim_key).transpose(1, 2)
+        v = self.to_v(x).view(B, N, H, self.dim_value).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
 
-        attn = torch.softmax(scores, dim=-1)
-        
-        if self.dropout_p > 0.0 and self.training:
-            attn = F.dropout(attn, p=self.dropout_p)
-            
-        out = torch.matmul(attn, v)
-
-        out = out.transpose(1, 2).contiguous().view(B, N, h * self.dim_value)
+        out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
         return self.to_out(out)
