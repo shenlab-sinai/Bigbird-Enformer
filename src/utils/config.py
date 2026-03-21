@@ -36,7 +36,7 @@ class EnformerConfig(PretrainedConfig):
         self.attn_dim_value = attn_dim_value
         self.block_size = block_size
 
-        assert attention_mode in {"block_sparse", "full", "bigbird"}, \
+        assert attention_mode in {"block_sparse", "full", "bigbird", "bigbird_ablation", "ccre_bigbird"}, \
             f"attention_mode must be 'block_sparse' or 'full', got {attention_mode}"
 
         self.attention_mode = attention_mode
