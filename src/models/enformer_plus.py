@@ -3,14 +3,6 @@ src/models/enformer_plus.py
 
 Adapted from enformer-pytorch by lucidrains.
 https://github.com/lucidrains/enformer-pytorch
-
-Changes vs original:
-  - Added BigBirdAttention, BlockSparseAttention, BigBirdAttentionAblation modes
-  - Added "ccre_bigbird" mode: biologically-grounded in-place cCRE global tokens
-    from the ENCODE4 SCREEN database. No injector/remover — T=1536 throughout.
-  - TransformerBlock class for ccre_bigbird: supports is_global kwarg passthrough.
-  - _run_trunk_ccre() method for ccre_bigbird forward path.
-  - Enformer.forward() accepts is_global=[B,1536] bool tensor for ccre_bigbird.
 """
 
 import sys
@@ -43,11 +35,11 @@ from src.layers.attention import (
 )
 from transformers import PreTrainedModel
 
-# constants
+# Constants
 SEQUENCE_LENGTH = 196_608
 TARGET_LENGTH   = 896
 
-# helpers
+# Helpers
 def exists(val):        return val is not None
 def default(val, d):    return val if exists(val) else d
 def map_values(fn, d):  return {key: fn(values) for key, values in d.items()}
@@ -75,7 +67,7 @@ def pearson_corr_coef(x, y, dim=1, reduce_dims=(-1,)):
     return F.cosine_similarity(x_centered, y_centered, dim=dim).mean(dim=reduce_dims)
 
 
-# global-token helpers (used by bigbird / block_sparse modes)
+# Global token helpers (used by bigbird / block_sparse modes)
 
 class SingleGlobalTokenInjector(nn.Module):
     """Prepends one learnable global token. Used by 'bigbird' mode."""
@@ -106,18 +98,17 @@ class ChunkGlobalTokenInjector(nn.Module):
         nn.init.normal_(self.g, std=init_std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, D = x.shape
-        C       = self.num_chunks
+        B, N, D  = x.shape
+        C        = self.num_chunks
         assert N % C == 0
-        n_chunk = N // C
+        n_chunk  = N // C
         x_chunks = x.view(B, C, n_chunk, D)
-        g = self.g.expand(B, -1, -1, -1)
-        interleaved = torch.cat([g, x_chunks], dim=2)
-        return interleaved.reshape(B, C * (1 + n_chunk), D)
+        g        = self.g.expand(B, -1, -1, -1)
+        return torch.cat([g, x_chunks], dim=2).reshape(B, C * (1 + n_chunk), D)
 
 
 class ChunkGlobalTokenRemover(nn.Module):
-    """Removes interleaved globals. Used by 'block_sparse' mode."""
+    """Removes interleaved globals inserted by ChunkGlobalTokenInjector."""
     def __init__(self, num_chunks: int):
         super().__init__()
         self.num_chunks = int(num_chunks)
@@ -134,12 +125,6 @@ class ChunkGlobalTokenRemover(nn.Module):
 # TransformerBlock for ccre_bigbird mode
 
 class TransformerBlock(nn.Module):
-    """
-    Single transformer block (pre-norm, attention + FFN with residuals).
-    Accepts an optional is_global kwarg that is forwarded to the attention layer.
-    Used exclusively by "ccre_bigbird" mode so that is_global can flow through
-    gradient checkpointing without modifying nn.Sequential / Residual wrappers.
-    """
     def __init__(self, dim: int, attn_layer: nn.Module, dropout_rate: float):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -156,16 +141,12 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
-        # Self-attention with residual
-        h = self.norm1(x)
-        h = self.attn(h, is_global=is_global)
-        x = x + self.drop1(h)
-        # FFN with residual
+        x = x + self.drop1(self.attn(self.norm1(x), is_global=is_global))
         x = x + self.ff(self.norm2(x))
         return x
 
 
-# standard building blocks (unchanged)
+# Standard building blocks
 
 class SinusoidalPositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=200_000):
@@ -242,7 +223,7 @@ def ConvBlock(dim, dim_out=None, kernel_size=1, is_distributed=None):
     )
 
 
-# main Enformer class
+# Main Enformer class
 
 class Enformer(PreTrainedModel):
     config_class      = EnformerConfig
@@ -254,19 +235,21 @@ class Enformer(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.dim              = config.dim
-        half_dim              = config.dim // 2
-        twice_dim             = config.dim * 2
-        self.attention_mode   = config.attention_mode
+        self.dim               = config.dim
+        half_dim               = config.dim // 2
+        twice_dim              = config.dim * 2
+        self.attention_mode    = config.attention_mode
         self.use_checkpointing = config.use_checkpointing
         self.uses_ccre_globals = (self.attention_mode == "ccre_bigbird")
 
+        # Stem
         self.stem = nn.Sequential(
             nn.Conv1d(4, half_dim, 15, padding=7),
             Residual(ConvBlock(half_dim)),
             AttentionPool(half_dim, pool_size=2),
         )
 
+        # Conv tower
         filter_list = exponential_linspace_int(
             half_dim, config.dim,
             num=config.num_downsamples - 1,
@@ -281,18 +264,16 @@ class Enformer(PreTrainedModel):
                 Residual(ConvBlock(dim_out, dim_out, 1)),
                 AttentionPool(dim_out, pool_size=2),
             ))
-        self.conv_tower = nn.Sequential(*conv_layers)
-
-        # Positional embedding
+        self.conv_tower    = nn.Sequential(*conv_layers)
         self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
-        # seq_len after conv tower (before any global-token injection)
+        # Sequence length after conv tower (before any global token injection)
         seq_len_trans = SEQUENCE_LENGTH // (2 ** config.num_downsamples)  # 1536
 
-        # Injector / Remover & Transformer
+        # Injector / Remover and Transformer
         if self.attention_mode in ("full", "bigbird_ablation"):
-            self.injector = nn.Identity()
-            self.remover  = nn.Identity()
+            self.injector    = nn.Identity()
+            self.remover     = nn.Identity()
             self.transformer = self._build_sequential_transformer(config)
 
         elif self.attention_mode == "bigbird":
@@ -301,11 +282,12 @@ class Enformer(PreTrainedModel):
                     f"BigBird: seq_len_trans={seq_len_trans} must be divisible by "
                     f"block_size={config.block_size}."
                 )
-            self.injector = SingleGlobalTokenInjector(config.dim)
-            self.remover  = SingleGlobalTokenRemover()
+            self.injector    = SingleGlobalTokenInjector(config.dim)
+            self.remover     = SingleGlobalTokenRemover()
             self.transformer = self._build_sequential_transformer(config)
 
         elif self.attention_mode == "ccre_bigbird":
+            # No injection or removal — T=1536 throughout
             self.injector = nn.Identity()
             self.remover  = nn.Identity()
             self.transformer = nn.ModuleList([
@@ -331,13 +313,14 @@ class Enformer(PreTrainedModel):
                     f"BlockSparse: seq_len_trans={seq_len_trans} must be divisible by "
                     f"block_size={config.block_size}."
                 )
-            num_chunks = seq_len_trans // config.block_size
-            self.injector = ChunkGlobalTokenInjector(config.dim, num_chunks=num_chunks)
-            self.remover  = ChunkGlobalTokenRemover(num_chunks=num_chunks)
+            num_chunks       = seq_len_trans // config.block_size
+            self.injector    = ChunkGlobalTokenInjector(config.dim, num_chunks=num_chunks)
+            self.remover     = ChunkGlobalTokenRemover(num_chunks=num_chunks)
             self.transformer = self._build_sequential_transformer(config)
 
-        self.target_length  = config.target_length
-        self.crop_final     = TargetLengthCrop(config.target_length)
+        # Output
+        self.target_length   = config.target_length
+        self.crop_final      = TargetLengthCrop(config.target_length)
         self.final_pointwise = nn.Sequential(
             Rearrange("b n d -> b d n"),
             ConvBlock(filter_list[-1], twice_dim, 1),
@@ -361,8 +344,6 @@ class Enformer(PreTrainedModel):
             )
 
         self.add_heads(**config.output_heads)
-
-    # helper: build nn.Sequential transformer (non-ccre modes)
 
     def _build_sequential_transformer(self, config):
         blocks = []
@@ -412,8 +393,6 @@ class Enformer(PreTrainedModel):
             ))
         return nn.Sequential(*blocks)
 
-    # output heads
-
     def add_heads(self, **kwargs):
         self.output_heads = kwargs
         self._heads = nn.ModuleDict(map_values(
@@ -424,8 +403,36 @@ class Enformer(PreTrainedModel):
     def set_target_length(self, target_length):
         self.crop_final.target_length = target_length
 
+    # Encode / decode split for classifier head integration
+
+    def _encode_ccre(self, x: torch.Tensor) -> torch.Tensor:
+        x = rearrange(x, "b n d -> b d n")
+        x = self.stem(x)
+        if self.use_checkpointing:
+            x = checkpoint_sequential(self.conv_tower, len(self.conv_tower), x, use_reentrant=False)
+        else:
+            x = self.conv_tower(x)
+        x = rearrange(x, "b d n -> b n d")
+        return self.pos_embedding(x)
+
+    def _decode_ccre(self, encoded: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+        x = encoded
+        for block in self.transformer:
+            if self.use_checkpointing:
+                if is_global is not None:
+                    x = checkpoint(block, x, is_global, use_reentrant=False)
+                else:
+                    x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x, is_global=is_global)
+
+        x = self.crop_final(x)
+        x = self.final_pointwise(x)
+        return x
+
+    # Non-ccre trunk paths
+
     def trunk_checkpointed(self, x):
-        """Checkpointed trunk for non-ccre modes."""
         x = rearrange(x, "b n d -> b d n")
         x = self.stem(x)
         x = checkpoint_sequential(self.conv_tower, len(self.conv_tower), x, use_reentrant=False)
@@ -438,37 +445,6 @@ class Enformer(PreTrainedModel):
         x = self.final_pointwise(x)
         return x
 
-    def _run_trunk_ccre(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
-        """
-        Forward trunk for ccre_bigbird mode.
-        is_global: [B, 1536] bool — passed through to every TransformerBlock.
-        """
-        x = rearrange(x, "b n d -> b d n")
-        x = self.stem(x)
-        if self.use_checkpointing:
-            x = checkpoint_sequential(self.conv_tower, len(self.conv_tower), x, use_reentrant=False)
-        else:
-            x = self.conv_tower(x)
-        x = rearrange(x, "b d n -> b n d")
-        x = self.injector(x)           # nn.Identity for ccre_bigbird
-        x = self.pos_embedding(x)
-
-        for block in self.transformer:
-            if self.use_checkpointing:
-                if is_global is not None:
-                    # checkpoint passes is_global as positional arg → forward(x, is_global)
-                    x = checkpoint(block, x, is_global, use_reentrant=False)
-                else:
-                    x = checkpoint(block, x, use_reentrant=False)
-            else:
-                x = block(x, is_global=is_global)
-
-        x = self.remover(x)            # nn.Identity for ccre_bigbird
-        x = self.crop_final(x)
-        x = self.final_pointwise(x)
-        return x
-
-
     def forward(
         self,
         x,
@@ -480,13 +456,6 @@ class Enformer(PreTrainedModel):
         head=None,
         target_length=None,
     ):
-        """
-        Args:
-            x:         [B, L, 4] one-hot DNA sequence  (L = 196608)
-            is_global: [B, 1536] bool cCRE mask.
-                       Only used when attention_mode == "ccre_bigbird".
-                       Ignored for all other modes.
-        """
         if isinstance(x, list):
             x = str_to_one_hot(x)
         elif isinstance(x, torch.Tensor) and x.dtype == torch.long:
@@ -500,11 +469,9 @@ class Enformer(PreTrainedModel):
         if exists(target_length):
             self.set_target_length(target_length)
 
-        # Route to the appropriate trunk
         if self.uses_ccre_globals:
-            # Pass is_global (may be None for mouse/zero-mask samples)
             _is_global = is_global.to(self.device) if is_global is not None else None
-            x = self._run_trunk_ccre(x, is_global=_is_global)
+            x = self._decode_ccre(self._encode_ccre(x), is_global=_is_global)
         elif self.use_checkpointing:
             x = self.trunk_checkpointed(x)
         else:

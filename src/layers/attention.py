@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class BigBirdAttention(nn.Module):
     """
     BigBird attention with ONE learnable global token prepended at position 0.
-    Layout: [global | local_0 ... local_{N-1}]  T = N+1, N must be divisible by block_size.
     Used with SingleGlobalTokenInjector / SingleGlobalTokenRemover.
     """
     def __init__(self, dim, heads=8, dim_key=64, dim_value=64,
@@ -29,8 +29,8 @@ class BigBirdAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         H, dk, dv, BS = self.heads, self.dim_key, self.dim_value, self.block_size
-        N  = T - 1
-        nb = N // BS
+        N    = T - 1
+        nb   = N // BS
         drop = self.dropout_p if self.training else 0.0
         assert N % BS == 0, f"Local length N={N} must be divisible by block_size={BS}"
 
@@ -38,7 +38,7 @@ class BigBirdAttention(nn.Module):
         k = self.to_k(x).view(B, T, H, dk).transpose(1, 2)
         v = self.to_v(x).view(B, T, H, dv).transpose(1, 2)
 
-        # Global token attends to all
+        # Global token attends to everything
         out_g = F.scaled_dot_product_attention(
             q[:, :, :1, :], k, v, dropout_p=drop, is_causal=False
         )
@@ -50,34 +50,34 @@ class BigBirdAttention(nn.Module):
         kx_blk = kx.view(B, H, nb, BS, dk)
         vx_blk = vx.view(B, H, nb, BS, dv)
 
-        zk    = kx.new_zeros(B, H, 1, BS, dk)
-        zv    = vx.new_zeros(B, H, 1, BS, dv)
+        zk     = kx.new_zeros(B, H, 1, BS, dk)
+        zv     = vx.new_zeros(B, H, 1, BS, dv)
         kx_pad = torch.cat([zk, kx_blk, zk], dim=2)
         vx_pad = torch.cat([zv, vx_blk, zv], dim=2)
 
         k_local = torch.cat([kx_pad[:, :, 0:nb], kx_pad[:, :, 1:nb+1], kx_pad[:, :, 2:nb+2]], dim=3)
         v_local = torch.cat([vx_pad[:, :, 0:nb], vx_pad[:, :, 1:nb+1], vx_pad[:, :, 2:nb+2]], dim=3)
 
+        # Prepend global key/value to each local block's context window
         kg_exp = kg.unsqueeze(2).expand(-1, -1, nb, -1, -1)
         vg_exp = vg.unsqueeze(2).expand(-1, -1, nb, -1, -1)
         k_full = torch.cat([kg_exp, k_local], dim=3)
         v_full = torch.cat([vg_exp, v_local], dim=3)
 
-        q_flat = qx_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,         dk)
-        k_flat = k_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS, dk)
-        v_flat = v_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS, dv)
-
+        q_flat   = qx_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,         dk)
+        k_flat   = k_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS, dk)
+        v_flat   = v_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS, dv)
         out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
-        out_x = out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
 
-        out = torch.cat([out_g, out_x], dim=2)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.inner_v)
+        out_x = out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
+        out   = torch.cat([out_g, out_x], dim=2)
+        out   = out.transpose(1, 2).contiguous().view(B, T, self.inner_v)
         return self.to_out(out)
 
 
 class BlockSparseAttention(nn.Module):
     """
-    Block Sparse Attention with Global Tokens.
+    Block sparse attention with interleaved global tokens.
     block_size includes the global token (e.g. 128 local + 1 global = 129).
     Used with ChunkGlobalTokenInjector / ChunkGlobalTokenRemover.
     """
@@ -98,10 +98,11 @@ class BlockSparseAttention(nn.Module):
         self.to_out = nn.Linear(self.inner_v, dim)
 
     def forward(self, x):
-        B, N, D = x.shape
-        H, BLK  = self.heads, self.block_size
+        B, N, D    = x.shape
+        H, BLK     = self.heads, self.block_size
         assert N % BLK == 0, f"Sequence length {N} must be divisible by block_size {BLK}"
         num_blocks = N // BLK
+        drop       = self.dropout_p if self.training else 0.0
 
         q = self.to_q(x)
         k = self.to_k(x)
@@ -111,27 +112,23 @@ class BlockSparseAttention(nn.Module):
         k_blk_view = k.view(B, num_blocks, BLK, H, self.dim_key)
         v_blk_view = v.view(B, num_blocks, BLK, H, self.dim_value)
 
-        q_blk = q_blk_view.reshape(B * num_blocks, BLK, H, self.dim_key).transpose(1, 2)
-        k_blk = k_blk_view.reshape(B * num_blocks, BLK, H, self.dim_key).transpose(1, 2)
-        v_blk = v_blk_view.reshape(B * num_blocks, BLK, H, self.dim_value).transpose(1, 2)
-
-        out_blk = F.scaled_dot_product_attention(
-            q_blk, k_blk, v_blk,
-            dropout_p=self.dropout_p if self.training else 0.0, is_causal=False
-        )
+        # Intra-block attention
+        q_blk  = q_blk_view.reshape(B * num_blocks, BLK, H, self.dim_key).transpose(1, 2)
+        k_blk  = k_blk_view.reshape(B * num_blocks, BLK, H, self.dim_key).transpose(1, 2)
+        v_blk  = v_blk_view.reshape(B * num_blocks, BLK, H, self.dim_value).transpose(1, 2)
+        out_blk = F.scaled_dot_product_attention(q_blk, k_blk, v_blk, dropout_p=drop, is_causal=False)
         out_blk = out_blk.view(B, num_blocks, H, BLK, self.dim_value)
 
-        q_g = q_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
-        k_g = k_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
-        v_g = v_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
-        out_g = F.scaled_dot_product_attention(
-            q_g, k_g, v_g,
-            dropout_p=self.dropout_p if self.training else 0.0, is_causal=False
-        )
+        # Global-to-global attention across all blocks
+        q_g   = q_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
+        k_g   = k_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
+        v_g   = v_blk_view[:, :, 0, :, :].permute(0, 2, 1, 3)
+        out_g = F.scaled_dot_product_attention(q_g, k_g, v_g, dropout_p=drop, is_causal=False)
 
+        # Combine intra-block and global outputs
         out_g_reshaped = out_g.permute(0, 2, 1, 3).unsqueeze(3)
-        global_part  = out_blk[:, :, :, 0:1, :] + out_g_reshaped
-        local_part   = out_blk[:, :, :, 1:,  :]
+        global_part    = out_blk[:, :, :, 0:1, :] + out_g_reshaped
+        local_part     = out_blk[:, :, :, 1:,  :]
 
         out_combined = torch.cat([global_part, local_part], dim=3)
         out_combined = out_combined.permute(0, 1, 3, 2, 4).reshape(B, N, self.inner_v)
@@ -139,7 +136,7 @@ class BlockSparseAttention(nn.Module):
 
 
 class FullAttention(nn.Module):
-    """Standard Full Attention via SDPA (FlashAttention eligible)."""
+    """Standard full attention via SDPA"""
     def __init__(self, dim, heads=8, dim_key=64, dim_value=64, dropout=0.0, **kwargs):
         super().__init__()
         self.heads     = heads
@@ -155,23 +152,21 @@ class FullAttention(nn.Module):
 
     def forward(self, x):
         B, N, _ = x.shape
-        H = self.heads
+        H        = self.heads
+        drop     = self.dropout_p if self.training else 0.0
+
         q = self.to_q(x).view(B, N, H, self.dim_key).transpose(1, 2)
         k = self.to_k(x).view(B, N, H, self.dim_key).transpose(1, 2)
         v = self.to_v(x).view(B, N, H, self.dim_value).transpose(1, 2)
-        out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout_p if self.training else 0.0, is_causal=False
-        )
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
         return self.to_out(out)
 
 
 class BigBirdAttentionAblation(nn.Module):
     """
-    BigBird local-window attention — NO global tokens.
-    Ablation baseline: pure sliding-window over N=1536 tokens.
-    Each 128bp block attends only to [prev | curr | next] blocks.
-    Use with nn.Identity() injector/remover.
+    BigBird local-window attention — no global tokens.
     """
     def __init__(self, dim, heads=8, dim_key=64, dim_value=64,
                  block_size=128, dropout=0.0, **kwargs):
@@ -189,10 +184,10 @@ class BigBirdAttentionAblation(nn.Module):
         self.to_out = nn.Linear(heads * dim_value, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, _ = x.shape
-        H, dk, dv, BS = self.heads, self.dim_key, self.dim_value, self.block_size
-        nb   = N // BS
-        drop = self.dropout_p if self.training else 0.0
+        B, N, _        = x.shape
+        H, dk, dv, BS  = self.heads, self.dim_key, self.dim_value, self.block_size
+        nb             = N // BS
+        drop           = self.dropout_p if self.training else 0.0
         assert N % BS == 0, f"N={N} must be divisible by block_size={BS}"
 
         q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)
@@ -211,11 +206,11 @@ class BigBirdAttentionAblation(nn.Module):
         k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
         v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
 
-        q_flat = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,     dk)
-        k_flat = k_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dk)
-        v_flat = v_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dv)
-
+        q_flat   = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,     dk)
+        k_flat   = k_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dk)
+        v_flat   = v_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dv)
         out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
+
         out = out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
         out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
         return self.to_out(out)
@@ -223,9 +218,8 @@ class BigBirdAttentionAblation(nn.Module):
 
 class BigBirdCCREAttention(nn.Module):
     """
-    BigBird attention with biologically grounded in-place cCRE global tokens.
+    BigBird attention with biologically-grounded in-place cCRE global tokens.
     """
-
     def __init__(self, dim, heads=8, dim_key=64, dim_value=64,
                  block_size=128, dropout=0.0, max_seq_len=1536, **kwargs):
         super().__init__()
@@ -241,7 +235,7 @@ class BigBirdCCREAttention(nn.Module):
         self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
         self.to_out = nn.Linear(heads * dim_value, dim)
 
-        # Pre-build local window mask [N, N] once; registered as a non-parameter buffer.
+        # Pre-build local window mask [N, N] once as a buffer.
         # local_window_mask[i, j] = True iff j is in the 3-block window around block(i).
         N, BS = max_seq_len, block_size
         assert N % BS == 0, f"max_seq_len={N} must be divisible by block_size={BS}"
@@ -253,31 +247,41 @@ class BigBirdCCREAttention(nn.Module):
             k_s = max(0, (bi - 1) * BS)
             k_e = min(N, (bi + 2) * BS)
             local_mask[q_s:q_e, k_s:k_e] = True
-        self.register_buffer("local_window_mask", local_mask)   # [N, N]
+        self.register_buffer("local_window_mask", local_mask)
 
     def forward(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
-        B, N, _ = x.shape
-        H, dk, dv = self.heads, self.dim_key, self.dim_value
-        drop = self.dropout_p if self.training else 0.0
+        B, N, _    = x.shape
+        H, dk, dv  = self.heads, self.dim_key, self.dim_value
+        drop       = self.dropout_p if self.training else 0.0
+        orig_dtype = x.dtype
 
-        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)   # [B, H, N, dk]
+        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)
         k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
         v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
 
         if is_global is None or not is_global.any():
+            # No globals → pure block-gather local window (FlashAttention eligible)
             out = self._local_window_forward(q, k, v, B, N, H, dk, dv, drop)
         else:
-            #   local_window_mask : [1, 1, N, N]  same for all samples
-            #   is_global rows    : [B, 1, N, 1]  global query --> attend to all keys
-            #   is_global cols    : [B, 1, 1, N]  all queries --> attend to global keys
-            attn_mask = (
+            # Build [B, 1, N, N] boolean attention mask
+            attn_bool = (
                 self.local_window_mask.view(1, 1, N, N)
                 | is_global.view(B, 1, N, 1)
                 | is_global.view(B, 1, 1, N)
-            )                                                  # [B, 1, N, N] bool
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=False
             )
+
+            # Convert to float32 additive mask (-inf/0) and run in fp32.
+            # bf16 softmax denominators underflow to 0 when using a boolean mask,
+            # causing NaN. fp32 eliminates this at a modest memory cost.
+            attn_float = torch.zeros(B, 1, N, N, dtype=torch.float32, device=x.device)
+            attn_float.masked_fill_(~attn_bool, float("-inf"))
+
+            out = F.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(),
+                attn_mask=attn_float,
+                dropout_p=drop,
+                is_causal=False,
+            ).to(orig_dtype)
 
         out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
         return self.to_out(out)
@@ -291,17 +295,17 @@ class BigBirdCCREAttention(nn.Module):
         k_blk = k.view(B, H, nb, BS, dk)
         v_blk = v.view(B, H, nb, BS, dv)
 
-        zk = k.new_zeros(B, H, 1, BS, dk)
-        zv = v.new_zeros(B, H, 1, BS, dv)
+        zk    = k.new_zeros(B, H, 1, BS, dk)
+        zv    = v.new_zeros(B, H, 1, BS, dv)
         k_pad = torch.cat([zk, k_blk, zk], dim=2)
         v_pad = torch.cat([zv, v_blk, zv], dim=2)
 
         k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
         v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
 
-        q_flat = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,     dk)
-        k_flat = k_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dk)
-        v_flat = v_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dv)
-
+        q_flat   = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,     dk)
+        k_flat   = k_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dk)
+        v_flat   = v_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dv)
         out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
+
         return out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)

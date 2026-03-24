@@ -4,12 +4,13 @@ import glob
 import time
 import numpy as np
 import torch
+from torch import nn
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
 from pathlib import Path
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.strategies import DDPStrategy
 from torchmetrics import Metric
 from torch.optim.lr_scheduler import LinearLR, ConstantLR, SequentialLR
@@ -24,7 +25,7 @@ from src.models.enformer_plus import Enformer
 from src.utils.config import EnformerConfig
 
 
-# Performance monitor 
+# Performance monitor
 
 class PerformanceMonitor(pl.Callback):
     def __init__(self, log_every=50):
@@ -70,22 +71,22 @@ class MeanPearsonCorrCoefPerChannel(Metric):
     def __init__(self, n_channels: int, dist_sync_on_step=False):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
         self.reduce_dims = (0, 1)
-        self.add_state("product", default=torch.zeros(n_channels), dist_reduce_fx="sum")
-        self.add_state("true", default=torch.zeros(n_channels), dist_reduce_fx="sum")
-        self.add_state("true_squared", default=torch.zeros(n_channels), dist_reduce_fx="sum")
-        self.add_state("pred", default=torch.zeros(n_channels), dist_reduce_fx="sum")
-        self.add_state("pred_squared", default=torch.zeros(n_channels), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.zeros(n_channels), dist_reduce_fx="sum")
+        self.add_state("product",       default=torch.zeros(n_channels), dist_reduce_fx="sum")
+        self.add_state("true",          default=torch.zeros(n_channels), dist_reduce_fx="sum")
+        self.add_state("true_squared",  default=torch.zeros(n_channels), dist_reduce_fx="sum")
+        self.add_state("pred",          default=torch.zeros(n_channels), dist_reduce_fx="sum")
+        self.add_state("pred_squared",  default=torch.zeros(n_channels), dist_reduce_fx="sum")
+        self.add_state("count",         default=torch.zeros(n_channels), dist_reduce_fx="sum")
 
     @torch.no_grad()
     def update(self, preds: torch.Tensor, target: torch.Tensor):
         preds = preds.clamp(min=1e-6)
-        self.product += torch.sum(preds * target, dim=self.reduce_dims)
-        self.true += torch.sum(target, dim=self.reduce_dims)
+        self.product      += torch.sum(preds * target,  dim=self.reduce_dims)
+        self.true         += torch.sum(target,          dim=self.reduce_dims)
         self.true_squared += torch.sum(target * target, dim=self.reduce_dims)
-        self.pred += torch.sum(preds, dim=self.reduce_dims)
-        self.pred_squared += torch.sum(preds * preds, dim=self.reduce_dims)
-        self.count += torch.sum(torch.ones_like(target), dim=self.reduce_dims)
+        self.pred         += torch.sum(preds,           dim=self.reduce_dims)
+        self.pred_squared += torch.sum(preds * preds,   dim=self.reduce_dims)
+        self.count        += torch.sum(torch.ones_like(target), dim=self.reduce_dims)
 
     def compute(self):
         true_mean  = self.true / (self.count + 1e-8)
@@ -101,15 +102,59 @@ class MeanPearsonCorrCoefPerChannel(Metric):
         return covariance / (torch.sqrt(true_var) * torch.sqrt(pred_var) + 1e-8)
 
 
+# Classifier head
+
+class CCREClassifierHead(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+    @torch.no_grad()
+    def topk_mask(self, x: torch.Tensor, k: int) -> torch.Tensor:
+        logits = self.forward(x)
+        k      = max(1, min(k, x.shape[1]))
+        mask   = torch.zeros_like(logits, dtype=torch.bool)
+        mask.scatter_(1, logits.topk(k, dim=1).indices, True)
+        return mask
+
+
 # Lightning module
 
 class BigBirdLightningModule(pl.LightningModule):
-    def __init__(self, model_config, lr=5e-4, warmup_steps=5000):
+    def __init__(self, model_config, lr=5e-4, warmup_steps=5000,
+                 use_classifier=True,
+                 classifier_hidden_dim=256,
+                 bce_weight=0.1,
+                 mean_ccre_k=460,
+                 mix_start_step=20_000,
+                 mix_steps=60_000):
         super().__init__()
         self.save_hyperparameters(ignore=["model_config"])
+
         self.model        = Enformer(model_config)
         self.lr           = float(lr)
         self.warmup_steps = int(warmup_steps)
+        self.is_ccre_mode = (model_config.attention_mode == "ccre_bigbird")
+
+        self.use_classifier = use_classifier and self.is_ccre_mode
+        self.bce_weight     = float(bce_weight)
+        self.mean_ccre_k    = int(mean_ccre_k)
+        self.mix_start_step = int(mix_start_step)
+        self.mix_steps      = int(mix_steps)
+
+        if self.use_classifier:
+            self.classifier = CCREClassifierHead(
+                dim=model_config.dim,
+                hidden_dim=classifier_hidden_dim,
+            )
 
         self.corr_human = MeanPearsonCorrCoefPerChannel(n_channels=5313)
         self.corr_mouse = MeanPearsonCorrCoefPerChannel(n_channels=1643)
@@ -118,60 +163,128 @@ class BigBirdLightningModule(pl.LightningModule):
         self.val_loss_n   = 0
 
     def _forward_organism(self, seq, organism, ccre_mask=None):
-        """
-        Forward pass for one organism.
-        ccre_mask: [B, 1536] bool or None.
-          - For ccre_bigbird mode: passed as is_global.
-          - For all other modes:  ignored (model ignores it internally).
-        """
+        """Standard forward for non-ccre modes."""
         return self.model(seq, is_global=ccre_mask)[organism]
+
+    def _forward_train(self, seq, gt_mask, organism):
+        encoded = self.model._encode_ccre(seq)
+        logits  = self.classifier(encoded.detach())
+        logits  = logits.clamp(-10.0, 10.0)
+
+        if self.global_step >= self.mix_start_step:
+            mix_ratio = min(1.0, (self.global_step - self.mix_start_step) / self.mix_steps)
+            with torch.no_grad():
+                gt_logits    = gt_mask.float() * 20.0 - 10.0
+                mixed_logits = (1 - mix_ratio) * gt_logits + mix_ratio * logits
+                k            = gt_mask.sum(dim=1).float().mean().round().long().clamp(1, 1536)
+                attn_mask    = torch.zeros_like(gt_mask)
+                if torch.isnan(mixed_logits).any():
+                    attn_mask = gt_mask 
+                else:
+                    attn_mask.scatter_(1, mixed_logits.topk(k, dim=1).indices, True)
+            self.log("train_mix_ratio", mix_ratio, on_step=True, prog_bar=False, sync_dist=False)
+        else:
+            attn_mask = gt_mask
+
+        trunk = self.model._decode_ccre(encoded, is_global=attn_mask)
+        pred  = self.model._heads[organism](trunk)
+        return pred, logits
+
+    def _forward_eval(self, seq, organism):
+        encoded   = self.model._encode_ccre(seq)
+        pred_mask = self.classifier.topk_mask(encoded, k=self.mean_ccre_k)
+        trunk     = self.model._decode_ccre(encoded, is_global=pred_mask)
+        return self.model._heads[organism](trunk)
 
     # Training
 
     def training_step(self, batch, batch_idx):
-        seq_h  = batch["human"]["sequence"]
-        tgt_h  = batch["human"]["target"].to(self.device, non_blocking=True)
-        mask_h = batch["human"].get("ccre_mask", None)
-        if mask_h is not None:
-            mask_h = mask_h.to(self.device, non_blocking=True)
+        seq_h = batch["human"]["sequence"]
+        tgt_h = batch["human"]["target"].to(self.device, non_blocking=True)
+        seq_m = batch["mouse"]["sequence"]
+        tgt_m = batch["mouse"]["target"].to(self.device, non_blocking=True)
 
-        seq_m  = batch["mouse"]["sequence"]
-        tgt_m  = batch["mouse"]["target"].to(self.device, non_blocking=True)
-        mask_m = batch["mouse"].get("ccre_mask", None)
-        if mask_m is not None:
-            mask_m = mask_m.to(self.device, non_blocking=True)
+        if self.is_ccre_mode and self.use_classifier:
+            mask_h = batch["human"]["ccre_mask"].to(self.device, non_blocking=True)
+            mask_m = batch["mouse"]["ccre_mask"].to(self.device, non_blocking=True)
 
-        pred_h = self._forward_organism(seq_h, "human", ccre_mask=mask_h)
-        pred_m = self._forward_organism(seq_m, "mouse", ccre_mask=mask_m)
+            pred_h, logits_h = self._forward_train(seq_h, mask_h, "human")
+            pred_m, logits_m = self._forward_train(seq_m, mask_m, "mouse")
 
-        loss_h = poisson_loss(pred_h, tgt_h)
-        loss_m = poisson_loss(pred_m, tgt_m)
-        loss   = (loss_h + loss_m) / 2.0
+            loss_h        = poisson_loss(pred_h, tgt_h)
+            loss_m        = poisson_loss(pred_m, tgt_m)
+            enformer_loss = (loss_h + loss_m) / 2.0
 
-        if torch.isnan(loss):
+            pos_frac_h = mask_h.float().mean().clamp(0.01, 0.99)
+            pos_frac_m = mask_m.float().mean().clamp(0.01, 0.99)
+            pos_w_h    = (1 - pos_frac_h) / pos_frac_h
+            pos_w_m    = (1 - pos_frac_m) / pos_frac_m
+            bce_h = F.binary_cross_entropy_with_logits(
+                logits_h, mask_h.float(), pos_weight=pos_w_h,
+            )
+            bce_m = F.binary_cross_entropy_with_logits(
+                logits_m, mask_m.float(), pos_weight=pos_w_m,
+            )
+            bce_loss   = (bce_h + bce_m) / 2.0
+            total_loss = enformer_loss + self.bce_weight * bce_loss
+
+            self.log("train_bce_loss", bce_loss, on_step=True, prog_bar=False, sync_dist=False)
+
+        else:
+            mask_h = batch["human"].get("ccre_mask", None)
+            mask_m = batch["mouse"].get("ccre_mask", None)
+            if mask_h is not None:
+                mask_h = mask_h.to(self.device, non_blocking=True)
+            if mask_m is not None:
+                mask_m = mask_m.to(self.device, non_blocking=True)
+
+            pred_h = self._forward_organism(seq_h, "human", ccre_mask=mask_h)
+            pred_m = self._forward_organism(seq_m, "mouse", ccre_mask=mask_m)
+            loss_h        = poisson_loss(pred_h, tgt_h)
+            loss_m        = poisson_loss(pred_m, tgt_m)
+            enformer_loss = (loss_h + loss_m) / 2.0
+            total_loss    = enformer_loss
+
+        if torch.isnan(total_loss):
             print(f"WARNING: NaN loss at step {self.global_step}, skipping optimizer step")
             return None
 
-        self.log("train_loss", loss, on_step=True, on_epoch=False, sync_dist=False, prog_bar=True)
-        self.log("train_loss_human", loss_h, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train_loss_mouse", loss_m, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train_loss_epoch", loss, on_step=False, on_epoch=True, sync_dist=True)
-        return loss
+        self.log("train_loss",        enformer_loss, on_step=True,  on_epoch=False, sync_dist=False, prog_bar=True)
+        self.log("train_loss_human",  loss_h,        on_step=True,  on_epoch=False, sync_dist=False)
+        self.log("train_loss_mouse",  loss_m,        on_step=True,  on_epoch=False, sync_dist=False)
+        self.log("train_loss_epoch",  enformer_loss, on_step=False, on_epoch=True,  sync_dist=True)
+        return total_loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        seq    = batch["sequence"]
-        target = batch["target"].to(self.device, non_blocking=True)
-        mask   = batch.get("ccre_mask", None)
-        if mask is not None:
-            mask = mask.to(self.device, non_blocking=True)
+        seq      = batch["sequence"]
+        target   = batch["target"].to(self.device, non_blocking=True)
+        organism = "human" if dataloader_idx == 0 else "mouse"
+
+        if self.is_ccre_mode and self.use_classifier:
+            encoded   = self.model._encode_ccre(seq)
+            pred_mask = self.classifier.topk_mask(encoded, k=self.mean_ccre_k)
+            trunk     = self.model._decode_ccre(encoded, is_global=pred_mask)
+            pred      = self.model._heads[organism](trunk)
+
+            # Precision and recall vs GT mask (human val only)
+            gt_mask = batch.get("ccre_mask", None)
+            if gt_mask is not None and dataloader_idx == 0:
+                gt_mask   = gt_mask.to(self.device, non_blocking=True)
+                precision = (pred_mask & gt_mask).float().sum(dim=1) / pred_mask.float().sum(dim=1).clamp(min=1)
+                recall    = (pred_mask & gt_mask).float().sum(dim=1) / gt_mask.float().sum(dim=1).clamp(min=1)
+                self.log("val_cls_precision", precision.mean(), on_epoch=True, sync_dist=True)
+                self.log("val_cls_recall",    recall.mean(),    on_epoch=True, sync_dist=True)
+        else:
+            mask = batch.get("ccre_mask", None)
+            if mask is not None:
+                mask = mask.to(self.device, non_blocking=True)
+            pred = self._forward_organism(seq, organism, ccre_mask=mask)
+
+        loss = poisson_loss(pred, target)
 
         if dataloader_idx == 0:
-            pred = self._forward_organism(seq, "human", ccre_mask=mask)
-            loss = poisson_loss(pred, target)
             self.corr_human.update(preds=pred.detach(), target=target.detach())
         else:
-            pred = self._forward_organism(seq, "mouse", ccre_mask=mask)
-            loss = poisson_loss(pred, target)
             self.corr_mouse.update(preds=pred.detach(), target=target.detach())
 
         self.val_loss_sum += loss.item() * seq.size(0)
@@ -188,9 +301,9 @@ class BigBirdLightningModule(pl.LightningModule):
         )
 
         self.log("val_corr_coef",  val_corr, on_epoch=True, sync_dist=True, prog_bar=True)
-        self.log("val_loss", val_loss, on_epoch=True, sync_dist=True, prog_bar=True)
-        self.log("val_corr_human", corr_h, on_epoch=True, sync_dist=True)
-        self.log("val_corr_mouse", corr_m, on_epoch=True, sync_dist=True)
+        self.log("val_loss",       val_loss,  on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log("val_corr_human", corr_h,   on_epoch=True, sync_dist=True)
+        self.log("val_corr_mouse", corr_m,   on_epoch=True, sync_dist=True)
 
         self.corr_human.reset()
         self.corr_mouse.reset()
@@ -199,6 +312,7 @@ class BigBirdLightningModule(pl.LightningModule):
         torch.cuda.empty_cache()
 
     def on_before_optimizer_step(self, optimizer):
+        # Zero NaN gradients before they corrupt Adam state
         has_nan_grad = False
         for name, param in self.named_parameters():
             if param.grad is not None and torch.isnan(param.grad).any():
@@ -207,13 +321,15 @@ class BigBirdLightningModule(pl.LightningModule):
         if has_nan_grad:
             print(f"WARNING: NaN gradient detected at step {self.global_step}, zeroed")
 
-        # Actually clip — float('inf') was a no-op
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.2)
         self.log("train_grad_norm", grad_norm, prog_bar=False, sync_dist=False)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
-            self.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-8,
+            self.parameters(),
+            lr=self.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
         )
         warmup_scheduler = LinearLR(
             optimizer, start_factor=1e-8, end_factor=1.0, total_iters=self.warmup_steps,
@@ -250,13 +366,6 @@ def reverse_complement_seq(seq: np.ndarray) -> np.ndarray:
 def augment_pair(seq: np.ndarray, target: np.ndarray,
                  ccre_mask: np.ndarray = None,
                  max_shift: int = 3):
-    """
-    Enformer-style training augmentation:
-      - Random shift +-max_shift bp (sub-bin, does not affect 128bp cCRE mask)
-      - 50% reverse complement (reverses sequence, target, AND ccre_mask)
-
-    Returns: (seq, target, ccre_mask)  — ccre_mask may be None.
-    """
     shift = np.random.randint(-max_shift, max_shift + 1)
     seq   = random_shift(seq, shift)
 
@@ -264,7 +373,6 @@ def augment_pair(seq: np.ndarray, target: np.ndarray,
         seq    = reverse_complement_seq(seq)
         target = target[::-1].copy()
         if ccre_mask is not None:
-            # Bins are reversed when sequence is reverse-complemented.
             ccre_mask = ccre_mask[::-1].copy()
 
     return seq, target, ccre_mask
@@ -276,11 +384,11 @@ class SingleOrganismDataset(torch.utils.data.Dataset):
     """
     Validation / test dataset for a single organism. No augmentation.
 
-    ccre_mask_dir: path to directory containing {split}-{i:06d}.npy masks.
+    ccre_mask_dir: path to directory containing masks.
                    If None, no ccre_mask is returned in items.
     """
     def __init__(self, npz_dir, split, ccre_mask_dir=None):
-        self.files        = sorted(glob.glob(str(Path(npz_dir) / f"{split}-*.npz")))
+        self.files         = sorted(glob.glob(str(Path(npz_dir) / f"{split}-*.npz")))
         self.ccre_mask_dir = Path(ccre_mask_dir) if ccre_mask_dir else None
         print(f"[{split}/{Path(npz_dir).name}] {len(self.files)} files")
 
@@ -306,18 +414,14 @@ class ZippedOrganismDataset(torch.utils.data.Dataset):
     """
     Zipped human + mouse training dataset.
     Each item returns one human and one mouse sample, augmented independently.
-
-    human_ccre_mask_dir / mouse_ccre_mask_dir:
-        Paths to precomputed ccre_mask .npy files (from ccre_preprocess.py).
-        If None, no ccre_mask is included in the batch.
     """
     def __init__(self, human_dir, mouse_dir, split,
                  human_ccre_mask_dir=None, mouse_ccre_mask_dir=None,
                  augment=True, max_shift=3):
         self.human_files = sorted(glob.glob(str(Path(human_dir) / f"{split}-*.npz")))
         self.mouse_files = sorted(glob.glob(str(Path(mouse_dir) / f"{split}-*.npz")))
-        self.augment = augment
-        self.max_shift = max_shift
+        self.augment     = augment
+        self.max_shift   = max_shift
 
         self.human_mask_dir = Path(human_ccre_mask_dir) if human_ccre_mask_dir else None
         self.mouse_mask_dir = Path(mouse_ccre_mask_dir) if mouse_ccre_mask_dir else None
@@ -333,7 +437,6 @@ class ZippedOrganismDataset(torch.utils.data.Dataset):
         return max(len(self.human_files), len(self.mouse_files))
 
     def _load_mask(self, mask_dir, npz_path) -> np.ndarray:
-        """Load ccre_mask for a given npz file. Returns zeros if not found."""
         if mask_dir is None:
             return None
         mask_path = mask_dir / Path(npz_path).name.replace(".npz", ".npy")
@@ -384,7 +487,6 @@ def zipped_collate_fn(batch):
             "target":   torch.stack([b["mouse"]["target"]   for b in batch]),
         },
     }
-    # Include ccre_mask only if it was loaded (consistent within a batch)
     if "ccre_mask" in batch[0]["human"]:
         result["human"]["ccre_mask"] = torch.stack([b["human"]["ccre_mask"] for b in batch])
     if "ccre_mask" in batch[0]["mouse"]:
@@ -465,10 +567,14 @@ if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32       = True
     torch.backends.cudnn.benchmark        = True
 
-    HUMAN_NPZ_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/human"
-    MOUSE_NPZ_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/mouse"
+    HUMAN_NPZ_DIR       = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/human"
+    MOUSE_NPZ_DIR       = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/mouse"
     HUMAN_CCRE_MASK_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/human"
     MOUSE_CCRE_MASK_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/mouse"
+
+    import pandas as pd
+    MEAN_CCRE_K = int(pd.read_csv(os.path.join(HUMAN_CCRE_MASK_DIR, "manifest.csv"))["n_ccre_bins"].mean())
+    print(f"MEAN_CCRE_K = {MEAN_CCRE_K} (read from manifest)")
 
     config = EnformerConfig(
         dim=1536,
@@ -477,7 +583,7 @@ if __name__ == "__main__":
         output_heads=dict(human=5313, mouse=1643),
         target_length=896,
         attention_mode="ccre_bigbird",
-        block_size=256,
+        block_size=128,
         use_checkpointing=True,
         attn_dropout=0.05,
         dropout_rate=0.4,
@@ -494,33 +600,36 @@ if __name__ == "__main__":
         num_workers=4,
     )
 
-    model = BigBirdLightningModule(config, lr=5e-4, warmup_steps=5000)
+    model = BigBirdLightningModule(
+        config,
+        lr=5e-4,
+        warmup_steps=5000,
+        use_classifier=True,
+        classifier_hidden_dim=256,
+        bce_weight=0.1,
+        mean_ccre_k=MEAN_CCRE_K,
+        mix_start_step=20_000,
+        mix_steps=60_000,
+    )
 
     logger = TensorBoardLogger(
         save_dir="/hpc/users/hongw01/Bigbird-Enformer/tb_logs",
-        name="ccre_bigbird",
-        version="v3_256_block_size",
+        name="ccre_bigbird_classifier",
+        version="no_bce_warmup_resume",   
     )
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_corr_coef",
         mode="max",
         save_top_k=1,
-        filename="ccre_bigbird-best-{epoch:02d}-{val_corr_coef:.4f}",
-        save_last=True,
-    )
-
-    early_stop_callback = EarlyStopping(
-        monitor="val_corr_coef",
-        patience=10,
-        mode="max",
-        verbose=True,
+        filename="ccre_cls-best-{epoch:02d}-{val_corr_coef:.4f}",
+        save_last=True,  
     )
 
     lr_monitor   = LearningRateMonitor(logging_interval="step")
     perf_monitor = PerformanceMonitor(log_every=50)
 
-    strategy = DDPStrategy(gradient_as_bucket_view=True)
+    strategy = DDPStrategy(gradient_as_bucket_view=True, find_unused_parameters=True)
 
     trainer = pl.Trainer(
         accelerator="gpu",
@@ -533,7 +642,7 @@ if __name__ == "__main__":
         gradient_clip_val=0.2,
         gradient_clip_algorithm="norm",
         logger=logger,
-        callbacks=[checkpoint_callback, lr_monitor, perf_monitor, early_stop_callback],
+        callbacks=[checkpoint_callback, lr_monitor, perf_monitor],
         sync_batchnorm=False,
         accumulate_grad_batches=1,
         log_every_n_steps=10,
@@ -543,4 +652,7 @@ if __name__ == "__main__":
         check_val_every_n_epoch=None,
     )
 
-    trainer.fit(model, dm)
+    # trainer.fit(model, dm)
+    CKPT_PATH = "/hpc/users/hongw01/Bigbird-Enformer/tb_logs/ccre_bigbird_classifier/no_bce_warmup/checkpoints/ccre_cls-best-epoch=103-val_corr_coef=0.6757.ckpt"
+
+    trainer.fit(model, dm, ckpt_path=CKPT_PATH)
