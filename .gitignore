@@ -2,11 +2,13 @@
 .idea/
 dataset/
 wandb/
+tb_logs/
 
 # Files:
 poetry.lock
 *.tar.gz
-
+*.npy
+*.bed
 
 # Created by https://www.toptal.com/developers/gitignore/api/python,pycharm,macos,linux
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,pycharm,macos,linux
