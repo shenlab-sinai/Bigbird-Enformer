@@ -3,6 +3,7 @@ src/models/enformer_plus.py
 
 Adapted from enformer-pytorch by lucidrains.
 https://github.com/lucidrains/enformer-pytorch
+
 """
 
 import sys
@@ -122,6 +123,24 @@ class ChunkGlobalTokenRemover(nn.Module):
         return x[:, :, 1:, :].reshape(B, C * (stride - 1), D)
 
 
+# Sinusoidal positional embedding (used by non-ccre modes only)
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=200_000):
+        super().__init__()
+        pe       = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10_000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.shape[1], :]
+
+
 # TransformerBlock for ccre_bigbird mode
 
 class TransformerBlock(nn.Module):
@@ -147,22 +166,6 @@ class TransformerBlock(nn.Module):
 
 
 # Standard building blocks
-
-class SinusoidalPositionalEmbedding(nn.Module):
-    def __init__(self, d_model, max_len=200_000):
-        super().__init__()
-        pe       = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10_000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, :x.shape[1], :]
-
 
 class Residual(nn.Module):
     def __init__(self, fn):
@@ -265,10 +268,16 @@ class Enformer(PreTrainedModel):
                 AttentionPool(dim_out, pool_size=2),
             ))
         self.conv_tower    = nn.Sequential(*conv_layers)
-        self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
         # Sequence length after conv tower (before any global token injection)
         seq_len_trans = SEQUENCE_LENGTH // (2 ** config.num_downsamples)  # 1536
+
+        # Positional embedding
+
+        if self.uses_ccre_globals or self.attention_mode == "full":
+            self.pos_embedding = nn.Identity()
+        else:
+            self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
         # Injector / Remover and Transformer
         if self.attention_mode in ("full", "bigbird_ablation"):
@@ -287,9 +296,11 @@ class Enformer(PreTrainedModel):
             self.transformer = self._build_sequential_transformer(config)
 
         elif self.attention_mode == "ccre_bigbird":
-            # No injection or removal — T=1536 throughout
             self.injector = nn.Identity()
             self.remover  = nn.Identity()
+
+            num_rel_pos_features = config.dim // config.heads   # 1536//8 = 192
+
             self.transformer = nn.ModuleList([
                 TransformerBlock(
                     dim=config.dim,
@@ -300,6 +311,8 @@ class Enformer(PreTrainedModel):
                         dim_key=config.attn_dim_key,
                         dim_value=config.attn_dim_value,
                         dropout=config.attn_dropout,
+                        pos_dropout=config.pos_dropout,
+                        num_rel_pos_features=num_rel_pos_features,
                         max_seq_len=seq_len_trans,
                     ),
                     dropout_rate=config.dropout_rate,
@@ -346,6 +359,9 @@ class Enformer(PreTrainedModel):
         self.add_heads(**config.output_heads)
 
     def _build_sequential_transformer(self, config):
+        seq_len_trans = SEQUENCE_LENGTH // (2 ** config.num_downsamples)  # 1536
+        num_rel_pos_features = config.dim // config.heads  # 192 for dim=1536, heads=8
+
         blocks = []
         for _ in range(config.depth):
             if self.attention_mode == "full":
@@ -353,6 +369,9 @@ class Enformer(PreTrainedModel):
                     dim=config.dim, heads=config.heads,
                     dim_key=config.attn_dim_key, dim_value=config.attn_dim_value,
                     dropout=config.attn_dropout,
+                    pos_dropout=config.pos_dropout,
+                    num_rel_pos_features=num_rel_pos_features,
+                    max_seq_len=seq_len_trans,
                 )
             elif self.attention_mode == "bigbird_ablation":
                 attn_layer = BigBirdAttentionAblation(
@@ -403,7 +422,7 @@ class Enformer(PreTrainedModel):
     def set_target_length(self, target_length):
         self.crop_final.target_length = target_length
 
-    # Encode / decode split for classifier head integration
+    # ccre_bigbird encode / transformer / decode split
 
     def _encode_ccre(self, x: torch.Tensor) -> torch.Tensor:
         x = rearrange(x, "b n d -> b d n")
@@ -413,9 +432,9 @@ class Enformer(PreTrainedModel):
         else:
             x = self.conv_tower(x)
         x = rearrange(x, "b d n -> b n d")
-        return self.pos_embedding(x)
+        return self.pos_embedding(x)   # nn.Identity() for ccre_bigbird
 
-    def _decode_ccre(self, encoded: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+    def _run_transformer_blocks(self, encoded: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
         x = encoded
         for block in self.transformer:
             if self.use_checkpointing:
@@ -425,14 +444,20 @@ class Enformer(PreTrainedModel):
                     x = checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x, is_global=is_global)
+        return x
 
+    def _crop_and_pointwise(self, x: torch.Tensor) -> torch.Tensor:
         x = self.crop_final(x)
         x = self.final_pointwise(x)
         return x
 
+    def _decode_ccre(self, encoded: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+        return self._crop_and_pointwise(self._run_transformer_blocks(encoded, is_global))
+
     # Non-ccre trunk paths
 
     def trunk_checkpointed(self, x):
+        """Checkpointed trunk for non-ccre modes."""
         x = rearrange(x, "b n d -> b d n")
         x = self.stem(x)
         x = checkpoint_sequential(self.conv_tower, len(self.conv_tower), x, use_reentrant=False)
