@@ -14,7 +14,7 @@ class EnformerConfig(PretrainedConfig):
         attn_dim_value=64,
         block_size=128,
 
-        attention_mode="block_sparse", 
+        attention_mode="block_sparse",
 
         dropout_rate=0.3,
         attn_dropout=0.05,
@@ -24,6 +24,9 @@ class EnformerConfig(PretrainedConfig):
         num_downsamples=7,
         dim_divisible_by=128,
         use_tf_gamma=False,
+
+        use_rel_pe=False,
+        use_einsum=False,
 
         **kwargs,
     ):
@@ -40,7 +43,7 @@ class EnformerConfig(PretrainedConfig):
             f"attention_mode must be 'block_sparse' or 'full', got {attention_mode}"
 
         self.attention_mode = attention_mode
-        
+
         self.dropout_rate = dropout_rate
         self.attn_dropout = attn_dropout
         self.pos_dropout = pos_dropout
@@ -49,5 +52,7 @@ class EnformerConfig(PretrainedConfig):
         self.num_downsamples = num_downsamples
         self.dim_divisible_by = dim_divisible_by
         self.use_tf_gamma = use_tf_gamma
+        self.use_rel_pe = use_rel_pe
+        self.use_einsum = use_einsum
 
         super().__init__(**kwargs)

@@ -16,25 +16,27 @@ sys.path.insert(0, project_root)
 
 from src.train_lightning import BigBirdLightningModule, SingleOrganismDataset
 from src.utils.config import EnformerConfig
+from src.utils.checkpoint_loading import load_atlas_checkpoint
 
 # Configuration
 
 USE_OFFICIAL = False
 
-CKPT_PATH = os.path.join(
-    project_root,
-    "tb_logs", "ccre_bigbird", "v2", "checkpoints",
-    "ccre_bigbird-best-epoch=80-val_corr_coef=0.6899.ckpt",
-)
+# CKPT_PATH = os.path.join(
+#     project_root,
+#     "tb_logs", "ATLAS-Ablation", "ablation-full-192k", "checkpoints",
+#     "ccre_cls-best-epoch=139-val_corr_coef=0.6751.ckpt",
+# )
+
+CKPT_PATH = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/tb_logs/ATLAS-Ablation/ablation-full-k153/checkpoints/ccre_cls-best-epoch=133-val_corr_coef=0.6751.ckpt"
 
 HUMAN_NPZ_DIR       = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/human"
 HUMAN_CCRE_MASK_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/human"
 
-# Set to None for full attention / non-ccre models (no mask needed)
-# Set to HUMAN_CCRE_MASK_DIR for ccre_bigbird
 CCRE_MASK_DIR = HUMAN_CCRE_MASK_DIR
 
-OUTPUT_DIR = os.path.join(project_root, "evaluation_results")
+run_version = Path(CKPT_PATH).parent.parent.name  
+OUTPUT_DIR = os.path.join(project_root, "evaluation_results", run_version)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BATCH_SIZE = 4
@@ -84,7 +86,6 @@ class TestDataModule(pl.LightningDataModule):
 # Metric
 
 class PearsonCorrPerChannel(Metric):
-    """Streaming Pearson R per output channel."""
     full_state_update = False
 
     def __init__(self, n_channels: int = 5313):
@@ -129,14 +130,17 @@ class EvalWrapper(pl.LightningModule):
         self._plotted     = False
 
     @torch.no_grad()
-    def _predict(self, seq: torch.Tensor, ccre_mask: torch.Tensor = None) -> torch.Tensor:
+    def _predict(self, seq, ccre_mask=None):
         if self.use_official:
             out = self.model(seq)
             return out["human"] if isinstance(out, dict) else out
         else:
-            # Pass ccre_mask as is_global for ccre_bigbird mode.
-            out = self.model.model(seq, is_global=ccre_mask)
-            return out["human"]
+            if self.model.is_ccre_mode and self.model.use_classifier:
+                pred, _ = self.model._forward_with_classifiers(seq, "human")
+                return pred
+            else:
+                out = self.model.model(seq, is_global=ccre_mask)
+                return out["human"]
 
     def test_step(self, batch, batch_idx):
         seq    = batch["sequence"]           # [B, L, 4]
@@ -176,7 +180,7 @@ class EvalWrapper(pl.LightningModule):
         print(f"GLOBAL   | {global_mean:>8.4f}")
 
         csv_path = os.path.join(OUTPUT_DIR, "evaluation_results.csv")
-        pd.DataFrame([results]).to_csv(csv_path, index=False)
+        pd.Series(results, name="value").to_csv(csv_path, header=False)
         print(f"\nSaved results to: {csv_path}")
 
         self._plot_corr_distribution(corr)
@@ -238,9 +242,7 @@ if __name__ == "__main__":
         from enformer_pytorch import from_pretrained
         OFFICIAL_ID = os.path.join(project_root, "Official_Enformer")
         print(f"Loading official Enformer from {OFFICIAL_ID}")
-        base_model = from_pretrained(
-            OFFICIAL_ID, target_length=896, use_tf_gamma=True, use_checkpointing=False,
-        )
+        base_model = load_atlas_checkpoint(CKPT_PATH, model_config=config)
         base_model.eval()
 
     else:
@@ -255,22 +257,23 @@ if __name__ == "__main__":
             target_length=896,
             attention_mode="ccre_bigbird",
             block_size=128,
-            use_checkpointing=False,
+            use_checkpointing=True,
             attn_dropout=0.05,
-            dropout_rate=0.4,
+            dropout_rate=0.3,
             pos_dropout=0.01,
+            use_rel_pe=False,
+            use_einsum = True,
         )
 
-        base_model = BigBirdLightningModule.load_from_checkpoint(
-            CKPT_PATH,
-            model_config=config,
-            weights_only=False,
-        )
+        base_model = load_atlas_checkpoint(CKPT_PATH, model_config=config)
         base_model.eval()
 
     eval_module = EvalWrapper(base_model, use_official=USE_OFFICIAL)
 
-    dm = TestDataModule(HUMAN_NPZ_DIR, batch_size=BATCH_SIZE, ccre_mask_dir=CCRE_MASK_DIR)
+    dm = TestDataModule(
+        HUMAN_NPZ_DIR,
+        batch_size=BATCH_SIZE,
+        ccre_mask_dir=CCRE_MASK_DIR)
 
     trainer = pl.Trainer(
         accelerator="gpu",

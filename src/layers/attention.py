@@ -3,8 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# Relative positional encoding helpers (ported from original Enformer)
+#  Relative positional encoding helpers
 
 def get_positional_features_exponential(
     positions: torch.Tensor,
@@ -13,13 +12,12 @@ def get_positional_features_exponential(
     min_half_life: float = 3.0,
     dtype: torch.dtype = torch.float,
 ) -> torch.Tensor:
-    """Exponential decay basis functions with log-spaced half-lives."""
     max_range = math.log(seq_len) / math.log(2.0)
     half_life = 2 ** torch.linspace(
         min_half_life, max_range, features, device=positions.device
     )
-    half_life = half_life[None, ...]          # [1, features]
-    positions = positions.abs()[..., None]     # [2N-1, 1]
+    half_life = half_life[None, ...]
+    positions = positions.abs()[..., None]
     return torch.exp(-math.log(2.0) / half_life * positions).to(dtype)
 
 
@@ -29,7 +27,6 @@ def get_positional_features_central_mask(
     seq_len: int,
     dtype: torch.dtype = torch.float,
 ) -> torch.Tensor:
-    """Binary central-mask basis: 1 if |distance| ≤ 2^i, else 0."""
     center_widths = 2 ** torch.arange(
         1, features + 1, device=positions.device
     ).to(dtype)
@@ -42,7 +39,6 @@ def gamma_pdf(
     concentration: torch.Tensor,
     rate: torch.Tensor,
 ) -> torch.Tensor:
-    """Gamma probability density function (unnormalized log-space)."""
     log_unnorm = torch.xlogy(concentration - 1.0, x) - rate * x
     log_norm   = torch.lgamma(concentration) - concentration * torch.log(rate)
     return torch.exp(log_unnorm - log_norm)
@@ -57,19 +53,16 @@ def get_positional_features_gamma(
     eps: float = 1e-8,
     dtype: torch.dtype = torch.float,
 ) -> torch.Tensor:
-    """Gamma-PDF basis functions with linearly spaced means."""
     if stddev is None:
         stddev = seq_len / (2 * features)
     if start_mean is None:
         start_mean = seq_len / features
-
     mean = torch.linspace(
         start_mean, seq_len, features, device=positions.device
     )
     mean = mean[None, ...]
     concentration = (mean / stddev) ** 2
     rate = mean / stddev ** 2
-
     probs = gamma_pdf(positions.to(dtype).abs()[..., None], concentration, rate)
     probs = probs + eps
     return probs / torch.amax(probs, dim=-1, keepdim=True)
@@ -81,61 +74,43 @@ def get_positional_embed(
     device: torch.device,
     dtype: torch.dtype = torch.float,
 ) -> torch.Tensor:
-    """
-    Build [2*seq_len - 1, feature_size] relative positional embeddings.
-
-    Uses three basis function families (exponential, central_mask, gamma),
-    each providing both a symmetric f(|d|) and an asymmetric sign(d)*f(|d|)
-    variant.  The six groups are concatenated to fill `feature_size`.
-
-    Matches the original Enformer paper (Extended Data Fig. 6) but always
-    uses the PyTorch gamma implementation (no TF precomputed gammas).
-    """
     distances = torch.arange(-seq_len + 1, seq_len, device=device)
-
     feature_functions = [
         get_positional_features_exponential,
         get_positional_features_central_mask,
         get_positional_features_gamma,
     ]
-    num_components = len(feature_functions) * 2   # symmetric + asymmetric
-
+    num_components = len(feature_functions) * 2
     if feature_size % num_components != 0:
         raise ValueError(
             f"feature_size={feature_size} must be divisible by "
             f"num_components={num_components} (3 basis families × 2)"
         )
     num_basis_per_class = feature_size // num_components
-
     embeddings = []
     for fn in feature_functions:
         embeddings.append(
             fn(distances, num_basis_per_class, seq_len, dtype=dtype)
         )
-    embeddings = torch.cat(embeddings, dim=-1)          # [2N-1, feat/2]
-
-    # Concatenate symmetric + asymmetric
+    embeddings = torch.cat(embeddings, dim=-1)
     embeddings = torch.cat(
         (embeddings, torch.sign(distances)[..., None] * embeddings), dim=-1
     )
-    return embeddings.to(dtype)   # [2N-1, feature_size]
+    return embeddings.to(dtype)
 
 
 def relative_shift(x: torch.Tensor) -> torch.Tensor:
-    """
-    Convert [B, H, N, 2N-1] relative-key logits into [B, H, N, N] with
-    correct j-i distance indexing.  (Transformer-XL / Enformer convention.)
-    """
     to_pad = torch.zeros_like(x[..., :1])
-    x = torch.cat((to_pad, x), dim=-1)         # [B, H, N, 2N]
+    x = torch.cat((to_pad, x), dim=-1)
     _, h, t1, t2 = x.shape
-    x = x.reshape(-1, h, t2, t1)                # [B, H, 2N, N]
-    x = x[:, :, 1:, :]                          # [B, H, 2N-1, N]
-    x = x.reshape(-1, h, t1, t2 - 1)            # [B, H, N, 2N-1]
-    return x[..., :((t2 + 1) // 2)]             # [B, H, N, N]
+    x = x.reshape(-1, h, t2, t1)
+    x = x[:, :, 1:, :]
+    x = x.reshape(-1, h, t1, t2 - 1)
+    return x[..., :((t2 + 1) // 2)]
 
+#  RELATIVE PE attention classes 
 
-class BigBirdCCREAttention(nn.Module):
+class RelBigBirdCCREAttention(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -158,13 +133,11 @@ class BigBirdCCREAttention(nn.Module):
         self.inner_v    = heads * dim_value
         self.scale      = dim_key ** -0.5
 
-        #
         self.to_q   = nn.Linear(dim, heads * dim_key,   bias=False)
         self.to_k   = nn.Linear(dim, heads * dim_key,   bias=False)
         self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
         self.to_out = nn.Linear(self.inner_v, dim)
 
-        
         nn.init.zeros_(self.to_out.weight)
         nn.init.zeros_(self.to_out.bias)
 
@@ -172,27 +145,21 @@ class BigBirdCCREAttention(nn.Module):
             num_rel_pos_features = dim // heads
         self.num_rel_pos_features = num_rel_pos_features
 
-        
         self.to_rel_k = nn.Linear(
             num_rel_pos_features, dim_key * heads, bias=False
         )
-        
-        self.rel_content_bias = nn.Parameter(
-            torch.randn(1, heads, 1, dim_key)
-        )
-        self.rel_pos_bias = nn.Parameter(
-            torch.randn(1, heads, 1, dim_key)
-        )
- 
+        self.rel_content_bias = nn.Parameter(torch.randn(1, heads, 1, dim_key))
+        self.rel_pos_bias     = nn.Parameter(torch.randn(1, heads, 1, dim_key))
+
         self.pos_dropout  = nn.Dropout(pos_dropout)
         self.attn_dropout = nn.Dropout(dropout)
-  
+
         N = max_seq_len
         pos_embed = get_positional_embed(
             N, num_rel_pos_features, torch.device("cpu"), dtype=torch.float
         )
-        self.register_buffer("pos_embed", pos_embed) 
-        
+        self.register_buffer("pos_embed", pos_embed)
+
         BS = block_size
         assert N % BS == 0, f"max_seq_len={N} must be divisible by block_size={BS}"
         nb = N // BS
@@ -205,52 +172,45 @@ class BigBirdCCREAttention(nn.Module):
             local_mask[q_s:q_e, k_s:k_e] = True
         self.register_buffer("local_window_mask", local_mask)
 
-    def forward(
-        self, x: torch.Tensor, is_global: torch.Tensor = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
         B, N, _ = x.shape
         H, dk, dv = self.heads, self.dim_key, self.dim_value
         orig_dtype = x.dtype
- 
-        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)   
+
+        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)
         k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
         v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
+        q = q * self.scale
 
-        q = q * self.scale   
-        
         content_logits = torch.einsum(
             "bhid,bhjd->bhij", q + self.rel_content_bias, k
-        )   
+        )
 
-        positions = self.pos_embed                             
+        positions = self.pos_embed
         positions = self.pos_dropout(positions)
-        rel_k = self.to_rel_k(positions)                       
-        rel_k = rel_k.view(-1, H, dk).permute(1, 0, 2)        
+        rel_k = self.to_rel_k(positions)
+        rel_k = rel_k.view(-1, H, dk).permute(1, 0, 2)
 
         rel_logits = torch.einsum(
             "bhid,hjd->bhij", q + self.rel_pos_bias, rel_k
-        )   
-        rel_logits = relative_shift(rel_logits)                
+        )
+        rel_logits = relative_shift(rel_logits)
 
-        
-        logits = content_logits + rel_logits                   
+        logits = content_logits + rel_logits
 
-        
         if is_global is not None and is_global.any():
             attn_bool = (
                 self.local_window_mask.view(1, 1, N, N)
-                | is_global.view(B, 1, N, 1)    
-                | is_global.view(B, 1, 1, N)    
+                | is_global.view(B, 1, N, 1)
+                | is_global.view(B, 1, 1, N)
             )
         else:
-            
             attn_bool = self.local_window_mask.view(1, 1, N, N)
 
         logits = logits.float()
         logits.masked_fill_(~attn_bool, float("-inf"))
 
         attn = logits.softmax(dim=-1)
-
         if self.training and self.dropout_p > 0:
             attn = self.attn_dropout(attn)
 
@@ -258,6 +218,387 @@ class BigBirdCCREAttention(nn.Module):
         out = out.to(orig_dtype)
         out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
         return self.to_out(out)
+
+
+class RelFullAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_key: int = 64,
+        dim_value: int = 64,
+        dropout: float = 0.0,
+        pos_dropout: float = 0.01,
+        num_rel_pos_features: int = None,
+        max_seq_len: int = 1536,
+        **kwargs,
+    ):
+        super().__init__()
+        self.heads      = heads
+        self.dim_key    = dim_key
+        self.dim_value  = dim_value
+        self.dropout_p  = float(dropout)
+        self.inner_v    = heads * dim_value
+        self.scale      = dim_key ** -0.5
+
+        self.to_q   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_k   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
+
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+        if num_rel_pos_features is None:
+            num_rel_pos_features = dim // heads
+        self.num_rel_pos_features = num_rel_pos_features
+
+        self.to_rel_k = nn.Linear(
+            num_rel_pos_features, dim_key * heads, bias=False
+        )
+        self.rel_content_bias = nn.Parameter(torch.randn(1, heads, 1, dim_key))
+        self.rel_pos_bias     = nn.Parameter(torch.randn(1, heads, 1, dim_key))
+
+        self.pos_dropout  = nn.Dropout(pos_dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+
+        pos_embed = get_positional_embed(
+            max_seq_len, num_rel_pos_features,
+            torch.device("cpu"), dtype=torch.float,
+        )
+        self.register_buffer("pos_embed", pos_embed)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, dk, dv = self.heads, self.dim_key, self.dim_value
+
+        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)
+        k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
+        v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
+        q = q * self.scale
+
+        content_logits = torch.einsum(
+            "bhid,bhjd->bhij", q + self.rel_content_bias, k
+        )
+
+        positions = self.pos_embed
+        positions = self.pos_dropout(positions)
+        rel_k = self.to_rel_k(positions)
+        rel_k = rel_k.view(-1, H, dk).permute(1, 0, 2)
+
+        rel_logits = torch.einsum(
+            "bhid,hjd->bhij", q + self.rel_pos_bias, rel_k
+        )
+        rel_logits = relative_shift(rel_logits)
+
+        logits = content_logits + rel_logits
+
+        attn = logits.softmax(dim=-1)
+        if self.training and self.dropout_p > 0:
+            attn = self.attn_dropout(attn)
+
+        out = torch.einsum("bhij,bhjd->bhid", attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
+        return self.to_out(out)
+
+#  ABSOLUTE PE attention classes 
+
+class FullAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_key: int = 64,
+        dim_value: int = 64,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__()
+        self.heads     = heads
+        self.dim_key   = dim_key
+        self.dim_value = dim_value
+        self.dropout_p = float(dropout)
+        self.inner_v   = heads * dim_value
+
+        self.to_q   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_k   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
+
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+    def forward(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, dk, dv = self.heads, self.dim_key, self.dim_value
+        drop = self.dropout_p if self.training else 0.0
+
+        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)
+        k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
+        v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop)
+        out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
+        return self.to_out(out)
+
+
+class FullAttentionEinsum(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_key: int = 64,
+        dim_value: int = 64,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__()
+        self.heads     = heads
+        self.dim_key   = dim_key
+        self.dim_value = dim_value
+        self.dropout_p = float(dropout)
+        self.inner_v   = heads * dim_value
+        self.scale     = dim_key ** -0.5
+
+        self.to_q   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_k   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
+
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, dk, dv = self.heads, self.dim_key, self.dim_value
+
+        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)   # [B, H, N, dk]
+        k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
+        v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
+
+        # Explicit N×N score matrix — O(N²) memory
+        scores = torch.einsum("bhid,bhjd->bhij", q, k) * self.scale   # [B, H, N, N]
+        attn = scores.softmax(dim=-1)                                   # [B, H, N, N]
+
+        if self.training and self.dropout_p > 0:
+            attn = self.attn_dropout(attn)
+
+        out = torch.einsum("bhij,bhjd->bhid", attn, v)                 # [B, H, N, dv]
+        out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
+        return self.to_out(out)
+
+
+class BigBirdCCREAttentionEinsum(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_key: int = 64,
+        dim_value: int = 64,
+        block_size: int = 128,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__()
+        self.heads      = heads
+        self.dim_key    = dim_key
+        self.dim_value  = dim_value
+        self.block_size = block_size
+        self.dropout_p  = float(dropout)
+        self.inner_v    = heads * dim_value
+        self.scale      = dim_key ** -0.5
+
+        self.to_q   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_k   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
+
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, dk, dv = self.heads, self.dim_key, self.dim_value
+        BS = self.block_size
+        nb = N // BS
+        assert N % BS == 0
+
+        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)
+        k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
+        v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
+
+        if is_global is not None and is_global.any():
+            out = self._sparse_forward_einsum(q, k, v, is_global, B, N, H, dk, dv, BS, nb)
+        else:
+            out = self._local_window_einsum(q, k, v, B, N, H, dk, dv, BS, nb)
+
+        out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
+        return self.to_out(out)
+
+    def _sparse_forward_einsum(self, q, k, v, is_global, B, N, H, dk, dv, BS, nb):
+        """Blockified with gathered globals — einsum, no SDPA."""
+        n_globals = is_global[0].sum().item()
+        gidx = is_global.float().topk(n_globals, dim=1).indices.sort(dim=1).values
+
+        idx_k = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dk)
+        idx_v = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dv)
+        k_global = k.gather(2, idx_k)
+        v_global = v.gather(2, idx_v)
+
+        q_blk = q.view(B, H, nb, BS, dk)
+        k_blk = k.view(B, H, nb, BS, dk)
+        v_blk = v.view(B, H, nb, BS, dv)
+
+        zk = k.new_zeros(B, H, 1, BS, dk)
+        zv = v.new_zeros(B, H, 1, BS, dv)
+        k_pad = torch.cat([zk, k_blk, zk], dim=2)
+        v_pad = torch.cat([zv, v_blk, zv], dim=2)
+
+        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
+        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
+
+        kg_exp = k_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)
+        vg_exp = v_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)
+        k_full = torch.cat([kg_exp, k_win], dim=3)  
+        v_full = torch.cat([vg_exp, v_win], dim=3)
+
+        scores = torch.einsum("bhnid,bhnjd->bhnij", q_blk, k_full) * self.scale
+        attn = scores.softmax(dim=-1)
+
+        if self.training and self.dropout_p > 0:
+            attn = self.attn_dropout(attn)
+
+        out = torch.einsum("bhnij,bhnjd->bhnid", attn, v_full)
+        return out.reshape(B, H, N, dv)
+
+    def _local_window_einsum(self, q, k, v, B, N, H, dk, dv, BS, nb):
+        q_blk = q.view(B, H, nb, BS, dk)
+        k_blk = k.view(B, H, nb, BS, dk)
+        v_blk = v.view(B, H, nb, BS, dv)
+
+        zk = k.new_zeros(B, H, 1, BS, dk)
+        zv = v.new_zeros(B, H, 1, BS, dv)
+        k_pad = torch.cat([zk, k_blk, zk], dim=2)
+        v_pad = torch.cat([zv, v_blk, zv], dim=2)
+
+        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
+        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
+
+        scores = torch.einsum("bhnid,bhnjd->bhnij", q_blk, k_win) * self.scale
+        attn = scores.softmax(dim=-1)
+
+        if self.training and self.dropout_p > 0:
+            attn = self.attn_dropout(attn)
+
+        out = torch.einsum("bhnij,bhnjd->bhnid", attn, v_win)
+        return out.reshape(B, H, N, dv)
+
+
+class BigBirdCCREAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_key: int = 64,
+        dim_value: int = 64,
+        block_size: int = 128,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__()
+        self.heads      = heads
+        self.dim_key    = dim_key
+        self.dim_value  = dim_value
+        self.block_size = block_size
+        self.dropout_p  = float(dropout)
+        self.inner_v    = heads * dim_value
+
+        self.to_q   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_k   = nn.Linear(dim, heads * dim_key,   bias=False)
+        self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
+        self.to_out = nn.Linear(self.inner_v, dim)
+
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+    def forward(self, x: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, dk, dv = self.heads, self.dim_key, self.dim_value
+        BS = self.block_size
+        nb = N // BS
+        drop = self.dropout_p if self.training else 0.0
+        assert N % BS == 0, f"N={N} must be divisible by block_size={BS}"
+
+        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)   # [B, H, N, dk]
+        k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
+        v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
+
+        if is_global is not None and is_global.any():
+            out = self._sparse_forward(q, k, v, is_global, B, N, H, dk, dv, BS, nb, drop)
+        else:
+            out = self._local_window_forward(q, k, v, B, N, H, dk, dv, BS, nb, drop)
+
+        out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
+        return self.to_out(out)
+
+    def _sparse_forward(self, q, k, v, is_global, B, N, H, dk, dv, BS, nb, drop):
+        n_globals = is_global[0].sum().item()
+        gidx = is_global.float().topk(n_globals, dim=1).indices.sort(dim=1).values  # [B, k]
+
+        idx_k = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dk)
+        idx_v = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dv)
+        k_global = k.gather(2, idx_k)   # [B, H, k, dk]
+        v_global = v.gather(2, idx_v)   # [B, H, k, dv]
+
+        q_blk = q.view(B, H, nb, BS, dk)
+        k_blk = k.view(B, H, nb, BS, dk)
+        v_blk = v.view(B, H, nb, BS, dv)
+
+        zk = k.new_zeros(B, H, 1, BS, dk)
+        zv = v.new_zeros(B, H, 1, BS, dv)
+        k_pad = torch.cat([zk, k_blk, zk], dim=2)
+        v_pad = torch.cat([zv, v_blk, zv], dim=2)
+
+        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
+        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
+
+        kg_exp = k_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)   # [B, H, nb, k, dk]
+        vg_exp = v_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)
+        k_full = torch.cat([kg_exp, k_win], dim=3)   # [B, H, nb, k+3*BS, dk]
+        v_full = torch.cat([vg_exp, v_win], dim=3)
+
+        L_kv = n_globals + 3 * BS
+        q_flat = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,   dk)
+        k_flat = k_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, L_kv, dk)
+        v_flat = v_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, L_kv, dv)
+
+        out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
+        return out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
+
+    def _local_window_forward(self, q, k, v, B, N, H, dk, dv, BS, nb, drop):
+        q_blk = q.view(B, H, nb, BS, dk)
+        k_blk = k.view(B, H, nb, BS, dk)
+        v_blk = v.view(B, H, nb, BS, dv)
+
+        zk = k.new_zeros(B, H, 1, BS, dk)
+        zv = v.new_zeros(B, H, 1, BS, dv)
+        k_pad = torch.cat([zk, k_blk, zk], dim=2)
+        v_pad = torch.cat([zv, v_blk, zv], dim=2)
+
+        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
+        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
+
+        q_flat = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,     dk)
+        k_flat = k_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dk)
+        v_flat = v_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dv)
+
+        out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
+        return out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
+
 
 class BigBirdAttention(nn.Module):
     """
@@ -379,105 +720,8 @@ class BlockSparseAttention(nn.Module):
         return self.to_out(out_combined)
 
 
-class FullAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        heads: int = 8,
-        dim_key: int = 64,
-        dim_value: int = 64,
-        dropout: float = 0.0,
-        pos_dropout: float = 0.01,
-        num_rel_pos_features: int = None,
-        max_seq_len: int = 1536,
-        **kwargs,
-    ):
-        super().__init__()
-        self.heads      = heads
-        self.dim_key    = dim_key
-        self.dim_value  = dim_value
-        self.dropout_p  = float(dropout)
-        self.inner_v    = heads * dim_value
-        self.scale      = dim_key ** -0.5
-
-        # Projections
-        self.to_q   = nn.Linear(dim, heads * dim_key,   bias=False)
-        self.to_k   = nn.Linear(dim, heads * dim_key,   bias=False)
-        self.to_v   = nn.Linear(dim, heads * dim_value, bias=False)
-        self.to_out = nn.Linear(self.inner_v, dim)
-
-        # Zero-init output projection → transformer blocks start as identity
-        nn.init.zeros_(self.to_out.weight)
-        nn.init.zeros_(self.to_out.bias)
-
-        # --- Relative positional encoding ---
-        if num_rel_pos_features is None:
-            num_rel_pos_features = dim // heads
-        self.num_rel_pos_features = num_rel_pos_features
-
-        self.to_rel_k = nn.Linear(
-            num_rel_pos_features, dim_key * heads, bias=False
-        )
-        self.rel_content_bias = nn.Parameter(
-            torch.randn(1, heads, 1, dim_key)
-        )
-        self.rel_pos_bias = nn.Parameter(
-            torch.randn(1, heads, 1, dim_key)
-        )
-
-        # Dropouts
-        self.pos_dropout  = nn.Dropout(pos_dropout)
-        self.attn_dropout = nn.Dropout(dropout)
-
-        # Precompute positional basis functions
-        pos_embed = get_positional_embed(
-            max_seq_len, num_rel_pos_features,
-            torch.device("cpu"), dtype=torch.float,
-        )
-        self.register_buffer("pos_embed", pos_embed)   # [2N-1, features]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, _ = x.shape
-        H, dk, dv = self.heads, self.dim_key, self.dim_value
-        orig_dtype = x.dtype
-
-        q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)   # [B, H, N, dk]
-        k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
-        v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
-
-        q = q * self.scale
-
-        content_logits = torch.einsum(
-            "bhid,bhjd->bhij", q + self.rel_content_bias, k
-        )  
-
-
-        positions = self.pos_embed                           
-        positions = self.pos_dropout(positions)
-        rel_k = self.to_rel_k(positions)                       
-        rel_k = rel_k.view(-1, H, dk).permute(1, 0, 2)       
-
-        rel_logits = torch.einsum(
-            "bhid,hjd->bhij", q + self.rel_pos_bias, rel_k
-        )  
-        rel_logits = relative_shift(rel_logits)              
-
-        logits = content_logits + rel_logits                 
-
-        attn = logits.softmax(dim=-1)
-
-        if self.training and self.dropout_p > 0:
-            attn = self.attn_dropout(attn)
-
-        out = torch.einsum("bhij,bhjd->bhid", attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
-        return self.to_out(out)
-
-
 class BigBirdAttentionAblation(nn.Module):
-    """
-    BigBird local-window attention — no global tokens.
-    """
+    """BigBird local-window attention — no global tokens."""
     def __init__(self, dim, heads=8, dim_key=64, dim_value=64,
                  block_size=128, dropout=0.0, **kwargs):
         super().__init__()

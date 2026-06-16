@@ -1,43 +1,22 @@
 """
-src/data/ccre_preprocess.py
-
 Precompute per-locus cCRE binary masks from ENCODE4 SCREEN BED file.
-
-How the flat npz files were generated (from generate_enformer_flat_npy.ipynb):
-  - sequences.bed rows are filtered by split (train/valid/test)
-  - The i-th row within a split → {split}-{i:06d}.npz
-  - Each BED locus (131,072 bp) is center-expanded to 196,608 bp via
-    kipoiseq Interval.resize: center = (start+end)//2, ±98304 bp
-
-This script replicates that expansion to compute the correct 1536-bin mask,
-and names each output mask identically to its npz: {split}-{i:06d}.npy
-so the dataloader can load it with a simple path.replace('.npz', '.npy').
 
 Usage:
     # Human (GRCh38)
-    python src/utils/ccre_preprocess.py \
+    python src/data/ccre_preprocess.py \
         --ccre_bed   /hpc/users/hongw01/Bigbird-Enformer/data/GRCh38-cCREs.bed \
         --seq_bed    /sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/basenji_data/human/sequences.bed \
-        --output_dir /sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/human
+        --output_dir /sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/human_50pct
 
-    # Mouse (GRCm38) — no SCREEN cCREs available, all masks will be zeros
-    python src/utils/ccre_preprocess.py \
+    # Mouse (GRCm38) 
+    python src/data/ccre_preprocess.py \
         --ccre_bed   /hpc/users/hongw01/Bigbird-Enformer/data/mm10-cCREs.bed \
         --seq_bed    /sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/basenji_data/mouse/sequences.bed \
-        --output_dir /sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/mouse
+        --output_dir /sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/mouse_50pct
 
 Output:
     {output_dir}/{split}-{i:06d}.npy   shape [1536] dtype bool
     {output_dir}/manifest.csv
-
-Bugs fixed vs original:
-  1. CRITICAL PERFORMANCE: original was O(N_bins * N_ccre_per_chrom) per locus
-     (~183 hours for human). Fixed with bisect → ~2 minutes total.
-  2. CORRECTNESS: original used `idx - 10` to find cCREs starting just before
-     the locus. Can silently miss cCREs if >10 small elements are packed in
-     [locus_start - max_ccre_width, locus_start]. Fixed with distance-based bisect.
-  3. CRASH: ENCODE BED files may contain 'browser' header lines which the original
-     did not skip, causing an IndexError crash on parsing.
 """
 
 import argparse
@@ -48,23 +27,16 @@ from pathlib import Path
 
 import numpy as np
 
-SEQ_LENGTH    = 196_608
-HALF_SEQ      = SEQ_LENGTH // 2   # 98304
-BIN_SIZE      = 128
-NUM_BINS      = SEQ_LENGTH // BIN_SIZE  # 1536
-MAX_CCRE_WIDTH = 1_000  # conservative upper bound for any SCREEN cCRE width (bp)
+SEQ_LENGTH     = 196_608
+HALF_SEQ       = SEQ_LENGTH // 2   # 98304
+BIN_SIZE       = 128
+NUM_BINS       = SEQ_LENGTH // BIN_SIZE  # 1536
+MAX_CCRE_WIDTH = 1_000
 
+DEFAULT_MIN_OVERLAP_BP = BIN_SIZE // 2   # 64
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
 
 def parse_seq_bed(path: str) -> dict:
-    """
-    Parse sequences.bed → {split: [(chrom, start, end), ...]}
-    Preserves original row order within each split (matches npz numbering).
-    Expected columns: chrom  start  end  split
-    """
     splits = defaultdict(list)
     with open(path) as f:
         for line in f:
@@ -78,122 +50,95 @@ def parse_seq_bed(path: str) -> dict:
 
 
 def parse_ccre_bed(path: str) -> list:
-    """
-    Parse ENCODE SCREEN cCRE BED file.
-    Handles 'track', 'browser', and '#' header lines that ENCODE BED files
-    commonly include at the top.
-    Returns list of (chrom, start, end) tuples.
-    """
     intervals = []
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            # Skip ALL known BED header line types
             if (line.startswith("#") or
                     line.startswith("track") or
-                    line.startswith("browser")):   # FIX: original missed 'browser' → crash
+                    line.startswith("browser")):
                 continue
             parts = line.split("\t")
             intervals.append((parts[0], int(parts[1]), int(parts[2])))
     return intervals
 
-
-# ---------------------------------------------------------------------------
-# Index construction
-# ---------------------------------------------------------------------------
-
 def build_chrom_index(intervals: list) -> dict:
-    """
-    Returns {chrom: {"intervals": [(start, end), ...], "starts": [int, ...]}}
-    Both lists are sorted by start position.
-
-    The pre-extracted 'starts' list is needed for O(log N) bisect lookups.
-    Storing it once here avoids rebuilding it inside the hot per-locus loop.
-    """
     raw = defaultdict(list)
     for chrom, start, end in intervals:
         raw[chrom].append((start, end))
 
     index = {}
     for chrom, ivs in raw.items():
-        ivs.sort()                         # sort by start
+        ivs.sort()
         index[chrom] = {
             "intervals": ivs,
             "starts":    [iv[0] for iv in ivs],
         }
     return index
 
-
-# ---------------------------------------------------------------------------
-# Coordinate helpers
-# ---------------------------------------------------------------------------
-
 def center_expand(chrom: str, start: int, end: int):
-    """Replicate kipoiseq Interval.resize(196608): expand from center."""
     center    = (start + end) // 2
     exp_start = center - HALF_SEQ
     exp_end   = center + HALF_SEQ
     return chrom, exp_start, exp_end
 
-
-# ---------------------------------------------------------------------------
-# Core mask computation
-# ---------------------------------------------------------------------------
-
-def locus_to_mask(chrom: str, locus_start: int, ccre_index: dict) -> np.ndarray:
+def locus_to_mask(
+    chrom:            str,
+    locus_start:      int,
+    ccre_index:       dict,
+    min_overlap_bp:   int = DEFAULT_MIN_OVERLAP_BP,
+) -> np.ndarray:
     """
-    Compute [NUM_BINS] bool mask: True if any cCRE overlaps that 128-bp bin.
-
-    Algorithm: O(K) where K = number of cCREs overlapping the locus window.
-      1. Binary-search for the first cCRE that could overlap the locus
-         (start >= locus_start - MAX_CCRE_WIDTH, catching cCREs that begin
-          just before the locus and extend into it).
-      2. Iterate forward, marking bins for each overlapping cCRE, stopping
-         when cCRE start >= locus_end.
-
-    Bin i covers [locus_start + i*128, locus_start + (i+1)*128).
-    A cCRE [cstart, cend) overlaps bin i if:
-        cstart < locus_start + (i+1)*128   AND   cend > locus_start + i*128
-    Equivalently, the range of bins touched by [cstart, cend) is:
-        bin_lo = floor((cstart - locus_start) / 128), clamped to [0, NUM_BINS-1]
-        bin_hi = floor((cend - 1 - locus_start) / 128), clamped to [0, NUM_BINS-1]
+    Compute [NUM_BINS] bool mask using a minimum-overlap threshold.
     """
-    mask = np.zeros(NUM_BINS, dtype=bool)
+    coverage = np.zeros(NUM_BINS, dtype=np.int32)
+
     if chrom not in ccre_index:
-        return mask
+        return coverage.astype(bool)
 
     entry     = ccre_index[chrom]
-    intervals = entry["intervals"]  # sorted list of (start, end)
-    starts    = entry["starts"]     # parallel list of starts for bisect
+    intervals = entry["intervals"]
+    starts    = entry["starts"]
     locus_end = locus_start + SEQ_LENGTH
 
-    # FIX: use distance-based bisect, not idx-10.
-    # Any cCRE starting before (locus_start - MAX_CCRE_WIDTH) cannot reach
-    # locus_start even at maximum width, so it is safe to start there.
     search_start = locus_start - MAX_CCRE_WIDTH
     lo = bisect.bisect_left(starts, search_start)
 
     for cstart, cend in intervals[lo:]:
         if cstart >= locus_end:
-            break                    # all remaining cCREs are past the locus
+            break
         if cend <= locus_start:
-            continue                 # cCRE ends before locus (from the lo offset)
+            continue
 
-        bin_lo = max(0,           (cstart - locus_start) // BIN_SIZE)
-        bin_hi = min(NUM_BINS - 1, (cend - 1 - locus_start) // BIN_SIZE)
-        if bin_lo <= bin_hi:
-            mask[bin_lo : bin_hi + 1] = True
+        # Clip cCRE to locus window
+        clipped_start = max(cstart, locus_start)
+        clipped_end   = min(cend,   locus_end)
 
-    return mask
+        # Bins this clipped cCRE touches
+        bin_lo = (clipped_start - locus_start) // BIN_SIZE
+        bin_hi = (clipped_end - 1 - locus_start) // BIN_SIZE
+        bin_lo = max(0, bin_lo)
+        bin_hi = min(NUM_BINS - 1, bin_hi)
 
+        for b in range(bin_lo, bin_hi + 1):
+            bin_start = locus_start + b * BIN_SIZE
+            bin_end   = bin_start + BIN_SIZE
+            # Overlap of this cCRE with bin b (clamped to bin boundaries)
+            overlap = min(cend, bin_end) - max(cstart, bin_start)
+            if overlap > 0:
+                # Cap at BIN_SIZE so multiple cCREs can't exceed 100% coverage
+                coverage[b] = min(BIN_SIZE, coverage[b] + overlap)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    return coverage >= min_overlap_bp
 
-def preprocess(ccre_bed: str, seq_bed: str, output_dir: str) -> None:
+def preprocess(
+    ccre_bed:       str,
+    seq_bed:        str,
+    output_dir:     str,
+    min_overlap_bp: int = DEFAULT_MIN_OVERLAP_BP,
+) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -201,6 +146,8 @@ def preprocess(ccre_bed: str, seq_bed: str, output_dir: str) -> None:
     ccre_index = build_chrom_index(parse_ccre_bed(ccre_bed))
     n_ccre = sum(len(v["intervals"]) for v in ccre_index.values())
     print(f"  {n_ccre:,} cCREs across {len(ccre_index)} chromosomes.")
+    print(f"  Overlap threshold: {min_overlap_bp} bp "
+          f"({min_overlap_bp / BIN_SIZE * 100:.0f}% of {BIN_SIZE}-bp bin)")
 
     print(f"Loading sequences.bed from {seq_bed} ...")
     splits = parse_seq_bed(seq_bed)
@@ -222,7 +169,8 @@ def preprocess(ccre_bed: str, seq_bed: str, output_dir: str) -> None:
             for i, (chrom, start, end) in enumerate(loci):
                 chrom, exp_start, exp_end = center_expand(chrom, start, end)
 
-                mask      = locus_to_mask(chrom, exp_start, ccre_index)
+                mask      = locus_to_mask(chrom, exp_start, ccre_index,
+                                          min_overlap_bp)
                 npz_fname = f"{split}-{i:06d}.npz"
                 npy_fname = f"{split}-{i:06d}.npy"
                 np.save(output_dir / npy_fname, mask)
@@ -239,10 +187,13 @@ def preprocess(ccre_bed: str, seq_bed: str, output_dir: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ccre_bed",   required=True,
-                        help="SCREEN cCRE BED (GRCh38 or GRCm38). "
-                             "Pass /dev/null for mouse (produces all-zero masks).")
-    parser.add_argument("--seq_bed",    required=True, help="basenji_data sequences.bed")
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--ccre_bed",        required=True)
+    parser.add_argument("--seq_bed",         required=True)
+    parser.add_argument("--output_dir",      required=True)
+    parser.add_argument("--min_overlap_bp",  type=int,
+                        default=DEFAULT_MIN_OVERLAP_BP,
+                        help=f"Min bp of cCRE coverage to mark a bin True "
+                             f"(default {DEFAULT_MIN_OVERLAP_BP} = 50%% of bin).")
     args = parser.parse_args()
-    preprocess(args.ccre_bed, args.seq_bed, args.output_dir)
+    preprocess(args.ccre_bed, args.seq_bed, args.output_dir,
+               args.min_overlap_bp)

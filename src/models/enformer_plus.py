@@ -4,11 +4,17 @@ src/models/enformer_plus.py
 Adapted from enformer-pytorch by lucidrains.
 https://github.com/lucidrains/enformer-pytorch
 
+Changes from original:
+  - use_rel_pe=True  (default): Transformer-XL relative PE inside attention.
+    Positional embedding is nn.Identity() for ccre_bigbird and full modes.
+  - use_rel_pe=False: Sinusoidal absolute PE added before transformer.
+    Attention uses SDPA (bf16, flash-attention eligible).
 """
 
 import sys
 import os
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -28,11 +34,19 @@ sys.path.insert(0, project_root)
 from src.utils.data import str_to_one_hot, seq_indices_to_one_hot
 from src.utils.config import EnformerConfig
 from src.layers.attention import (
-    BlockSparseAttention,
+    # Abs PE + SDPA (fast)
     FullAttention,
+    BigBirdCCREAttention,
+    # Abs PE + Einsum (no FlashAttention)
+    FullAttentionEinsum,
+    BigBirdCCREAttentionEinsum,
+    # Rel PE (original, slow)
+    RelFullAttention,
+    RelBigBirdCCREAttention,
+    # Other modes (unchanged)
+    BlockSparseAttention,
     BigBirdAttention,
     BigBirdAttentionAblation,
-    BigBirdCCREAttention,
 )
 from transformers import PreTrainedModel
 
@@ -68,8 +82,6 @@ def pearson_corr_coef(x, y, dim=1, reduce_dims=(-1,)):
     return F.cosine_similarity(x_centered, y_centered, dim=dim).mean(dim=reduce_dims)
 
 
-# Global token helpers (used by bigbird / block_sparse modes)
-
 class SingleGlobalTokenInjector(nn.Module):
     """Prepends one learnable global token. Used by 'bigbird' mode."""
     def __init__(self, dim: int, init_std: float = 0.02):
@@ -88,10 +100,6 @@ class SingleGlobalTokenRemover(nn.Module):
 
 
 class ChunkGlobalTokenInjector(nn.Module):
-    """
-    Inserts C learnable globals interleaved with C equal chunks.
-    Used by 'block_sparse' mode.
-    """
     def __init__(self, dim: int, num_chunks: int, init_std: float = 0.02):
         super().__init__()
         self.num_chunks = int(num_chunks)
@@ -109,7 +117,6 @@ class ChunkGlobalTokenInjector(nn.Module):
 
 
 class ChunkGlobalTokenRemover(nn.Module):
-    """Removes interleaved globals inserted by ChunkGlobalTokenInjector."""
     def __init__(self, num_chunks: int):
         super().__init__()
         self.num_chunks = int(num_chunks)
@@ -122,8 +129,6 @@ class ChunkGlobalTokenRemover(nn.Module):
         x = x.view(B, C, stride, D)
         return x[:, :, 1:, :].reshape(B, C * (stride - 1), D)
 
-
-# Sinusoidal positional embedding (used by non-ccre modes only)
 
 class SinusoidalPositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=200_000):
@@ -139,9 +144,6 @@ class SinusoidalPositionalEmbedding(nn.Module):
 
     def forward(self, x):
         return x + self.pe[:, :x.shape[1], :]
-
-
-# TransformerBlock for ccre_bigbird mode
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim: int, attn_layer: nn.Module, dropout_rate: float):
@@ -163,9 +165,6 @@ class TransformerBlock(nn.Module):
         x = x + self.drop1(self.attn(self.norm1(x), is_global=is_global))
         x = x + self.ff(self.norm2(x))
         return x
-
-
-# Standard building blocks
 
 class Residual(nn.Module):
     def __init__(self, fn):
@@ -225,9 +224,6 @@ def ConvBlock(dim, dim_out=None, kernel_size=1, is_distributed=None):
         nn.Conv1d(dim, default(dim_out, dim), kernel_size, padding=kernel_size // 2),
     )
 
-
-# Main Enformer class
-
 class Enformer(PreTrainedModel):
     config_class      = EnformerConfig
     base_model_prefix = "enformer"
@@ -244,6 +240,10 @@ class Enformer(PreTrainedModel):
         self.attention_mode    = config.attention_mode
         self.use_checkpointing = config.use_checkpointing
         self.uses_ccre_globals = (self.attention_mode == "ccre_bigbird")
+
+        # ── use_rel_pe flag (default True for backward compat) ──
+        self.use_rel_pe = getattr(config, "use_rel_pe", False)
+        self.use_einsum = getattr(config, "use_einsum", False)
 
         # Stem
         self.stem = nn.Sequential(
@@ -267,19 +267,23 @@ class Enformer(PreTrainedModel):
                 Residual(ConvBlock(dim_out, dim_out, 1)),
                 AttentionPool(dim_out, pool_size=2),
             ))
-        self.conv_tower    = nn.Sequential(*conv_layers)
+        self.conv_tower = nn.Sequential(*conv_layers)
 
-        # Sequence length after conv tower (before any global token injection)
         seq_len_trans = SEQUENCE_LENGTH // (2 ** config.num_downsamples)  # 1536
 
-        # Positional embedding
-
-        if self.uses_ccre_globals or self.attention_mode == "full":
-            self.pos_embedding = nn.Identity()
+        # ── Positional embedding ──
+        # Rel PE modes: Identity (PE computed inside attention)
+        # Abs PE modes: Sinusoidal (PE added before transformer)
+        # Other modes (bigbird, block_sparse): always sinusoidal
+        if self.attention_mode in ("ccre_bigbird", "full"):
+            if self.use_rel_pe:
+                self.pos_embedding = nn.Identity()
+            else:
+                self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
         else:
             self.pos_embedding = SinusoidalPositionalEmbedding(config.dim)
 
-        # Injector / Remover and Transformer
+        # ── Injector / Remover and Transformer ──
         if self.attention_mode in ("full", "bigbird_ablation"):
             self.injector    = nn.Identity()
             self.remover     = nn.Identity()
@@ -298,27 +302,7 @@ class Enformer(PreTrainedModel):
         elif self.attention_mode == "ccre_bigbird":
             self.injector = nn.Identity()
             self.remover  = nn.Identity()
-
-            num_rel_pos_features = config.dim // config.heads   # 1536//8 = 192
-
-            self.transformer = nn.ModuleList([
-                TransformerBlock(
-                    dim=config.dim,
-                    attn_layer=BigBirdCCREAttention(
-                        dim=config.dim,
-                        heads=config.heads,
-                        block_size=config.block_size,
-                        dim_key=config.attn_dim_key,
-                        dim_value=config.attn_dim_value,
-                        dropout=config.attn_dropout,
-                        pos_dropout=config.pos_dropout,
-                        num_rel_pos_features=num_rel_pos_features,
-                        max_seq_len=seq_len_trans,
-                    ),
-                    dropout_rate=config.dropout_rate,
-                )
-                for _ in range(config.depth)
-            ])
+            self.transformer = self._build_ccre_transformer(config, seq_len_trans)
 
         else:  # block_sparse
             if seq_len_trans % config.block_size != 0:
@@ -358,21 +342,74 @@ class Enformer(PreTrainedModel):
 
         self.add_heads(**config.output_heads)
 
+        self._time_transformer = False
+        self._transformer_ms = None
+
+    def _build_ccre_transformer(self, config, seq_len_trans):
+        """Build transformer for ccre_bigbird mode (rel or abs PE)."""
+        num_rel_pos_features = config.dim // config.heads  # 192
+
+        if self.use_rel_pe:
+            attn_cls   = RelBigBirdCCREAttention
+            attn_extra = dict(
+                pos_dropout=config.pos_dropout,
+                num_rel_pos_features=num_rel_pos_features,
+                max_seq_len=seq_len_trans,
+            )
+        elif self.use_einsum:
+            # Abs PE + einsum 
+            attn_cls   = BigBirdCCREAttentionEinsum
+            attn_extra = {}
+        else:
+            # Abs PE + SDPA 
+            attn_cls   = BigBirdCCREAttention
+            attn_extra = {}
+
+        return nn.ModuleList([
+            TransformerBlock(
+                dim=config.dim,
+                attn_layer=attn_cls(
+                    dim=config.dim,
+                    heads=config.heads,
+                    block_size=config.block_size,
+                    dim_key=config.attn_dim_key,
+                    dim_value=config.attn_dim_value,
+                    dropout=config.attn_dropout,
+                    **attn_extra,
+                ),
+                dropout_rate=config.dropout_rate,
+            )
+            for _ in range(config.depth)
+        ])
+
     def _build_sequential_transformer(self, config):
-        seq_len_trans = SEQUENCE_LENGTH // (2 ** config.num_downsamples)  # 1536
-        num_rel_pos_features = config.dim // config.heads  # 192 for dim=1536, heads=8
+        seq_len_trans = SEQUENCE_LENGTH // (2 ** config.num_downsamples)
+        num_rel_pos_features = config.dim // config.heads
 
         blocks = []
         for _ in range(config.depth):
             if self.attention_mode == "full":
-                attn_layer = FullAttention(
-                    dim=config.dim, heads=config.heads,
-                    dim_key=config.attn_dim_key, dim_value=config.attn_dim_value,
-                    dropout=config.attn_dropout,
-                    pos_dropout=config.pos_dropout,
-                    num_rel_pos_features=num_rel_pos_features,
-                    max_seq_len=seq_len_trans,
-                )
+                if self.use_rel_pe:
+                    attn_layer = RelFullAttention(
+                        dim=config.dim, heads=config.heads,
+                        dim_key=config.attn_dim_key, dim_value=config.attn_dim_value,
+                        dropout=config.attn_dropout,
+                        pos_dropout=config.pos_dropout,
+                        num_rel_pos_features=num_rel_pos_features,
+                        max_seq_len=seq_len_trans,
+                    )
+                elif self.use_einsum:
+                    attn_layer = FullAttentionEinsum(
+                        dim=config.dim, heads=config.heads,
+                        dim_key=config.attn_dim_key, dim_value=config.attn_dim_value,
+                        dropout=config.attn_dropout,
+                    )
+                else:
+                    attn_layer = FullAttention(
+                        dim=config.dim, heads=config.heads,
+                        dim_key=config.attn_dim_key, dim_value=config.attn_dim_value,
+                        dropout=config.attn_dropout,
+                    )
             elif self.attention_mode == "bigbird_ablation":
                 attn_layer = BigBirdAttentionAblation(
                     dim=config.dim, heads=config.heads,
@@ -422,8 +459,6 @@ class Enformer(PreTrainedModel):
     def set_target_length(self, target_length):
         self.crop_final.target_length = target_length
 
-    # ccre_bigbird encode / transformer / decode split
-
     def _encode_ccre(self, x: torch.Tensor) -> torch.Tensor:
         x = rearrange(x, "b n d -> b d n")
         x = self.stem(x)
@@ -432,11 +467,34 @@ class Enformer(PreTrainedModel):
         else:
             x = self.conv_tower(x)
         x = rearrange(x, "b d n -> b n d")
-        return self.pos_embedding(x)   # nn.Identity() for ccre_bigbird
+        return self.pos_embedding(x) 
 
     def _run_transformer_blocks(self, encoded: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
+        if self._time_transformer and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         x = encoded
         for block in self.transformer:
+            if self.use_checkpointing:
+                if is_global is not None:
+                    x = checkpoint(block, x, is_global, use_reentrant=False)
+                else:
+                    x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x, is_global=is_global)
+
+        if self._time_transformer and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self._transformer_ms = (time.perf_counter() - _t0) * 1000
+
+        return x
+
+    def _run_transformer_group(self, x: torch.Tensor, start: int, end: int,
+                                is_global: torch.Tensor = None) -> torch.Tensor:
+
+        for i in range(start, end):
+            block = self.transformer[i]
             if self.use_checkpointing:
                 if is_global is not None:
                     x = checkpoint(block, x, is_global, use_reentrant=False)
@@ -454,17 +512,24 @@ class Enformer(PreTrainedModel):
     def _decode_ccre(self, encoded: torch.Tensor, is_global: torch.Tensor = None) -> torch.Tensor:
         return self._crop_and_pointwise(self._run_transformer_blocks(encoded, is_global))
 
-    # Non-ccre trunk paths
-
     def trunk_checkpointed(self, x):
-        """Checkpointed trunk for non-ccre modes."""
         x = rearrange(x, "b n d -> b d n")
         x = self.stem(x)
         x = checkpoint_sequential(self.conv_tower, len(self.conv_tower), x, use_reentrant=False)
         x = rearrange(x, "b d n -> b n d")
         x = self.injector(x)
         x = self.pos_embedding(x)
+
+        if self._time_transformer and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         x = checkpoint_sequential(self.transformer, len(self.transformer), x, use_reentrant=False)
+
+        if self._time_transformer and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self._transformer_ms = (time.perf_counter() - _t0) * 1000
+
         x = self.remover(x)
         x = self.crop_final(x)
         x = self.final_pointwise(x)
