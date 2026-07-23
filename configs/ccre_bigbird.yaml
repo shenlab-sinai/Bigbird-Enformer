@@ -73,6 +73,7 @@ training:
     #   transformer-engine-float16: Transformer Engine with FP16 higher precision
     precision: bf16-mixed
 
+    # Authoritative gradient clipping configuration used by Lightning.
     gradient_clip_val: 0.2
     gradient_clip_algorithm: norm
     accumulate_grad_batches: 1

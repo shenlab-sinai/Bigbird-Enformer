@@ -517,14 +517,22 @@ class BigBirdLightningModule(pl.LightningModule):
 
     def on_before_optimizer_step(self, optimizer):
         has_nan_grad = False
+        gradients = []
         for name, param in self.named_parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
+            if param.grad is None:
+                continue
+            if torch.isnan(param.grad).any():
                 param.grad.zero_()
                 has_nan_grad = True
+            gradients.append(param.grad.detach())
         if has_nan_grad:
             print(f"WARNING: NaN gradient detected at step {self.global_step}, zeroed")
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.2)
-        self.log("train_grad_norm", grad_norm, prog_bar=False, sync_dist=False)
+        if gradients:
+            grad_norm = torch.linalg.vector_norm(
+                torch.stack([gradient.norm(2) for gradient in gradients]),
+                ord=2,
+            )
+            self.log("train_grad_norm", grad_norm, prog_bar=False, sync_dist=False)
 
     def configure_optimizers(self):
         decay, no_decay = [], []

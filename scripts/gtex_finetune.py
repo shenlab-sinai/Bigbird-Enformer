@@ -271,11 +271,19 @@ class GTExFinetuneModule(pl.LightningModule):
               f"per-sample={pearson_sample:.4f}  per-tissue={pearson_tissue:.4f}")
 
     def on_before_optimizer_step(self, optimizer):
+        gradients = []
         for p in self.parameters():
-            if p.grad is not None and torch.isnan(p.grad).any():
+            if p.grad is None:
+                continue
+            if torch.isnan(p.grad).any():
                 p.grad.zero_()
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=grad_clip)
-        self.log("train_grad_norm", grad_norm, prog_bar=False, sync_dist=False)
+            gradients.append(p.grad.detach())
+        if gradients:
+            grad_norm = torch.linalg.vector_norm(
+                torch.stack([gradient.norm(2) for gradient in gradients]),
+                ord=2,
+            )
+            self.log("train_grad_norm", grad_norm, prog_bar=False, sync_dist=False)
 
     def configure_optimizers(self):
         head_params     = list(self.gtex_head.parameters())

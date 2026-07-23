@@ -133,6 +133,37 @@ def test_optimizer_separates_decay_and_no_decay_parameters(tiny_config_factory):
     assert configuration["lr_scheduler"]["interval"] == "step"
 
 
+def test_optimizer_hook_reports_norm_without_clipping(
+    tiny_config_factory,
+    monkeypatch,
+):
+    module = BigBirdLightningModule(
+        tiny_config_factory(),
+        use_classifier=False,
+    )
+    parameter = next(module.parameters())
+    parameter.grad = torch.ones_like(parameter)
+    logged = {}
+    monkeypatch.setattr(
+        torch.nn.utils,
+        "clip_grad_norm_",
+        lambda *args, **kwargs: pytest.fail("manual clipping must not run"),
+    )
+    monkeypatch.setattr(
+        module,
+        "log",
+        lambda name, value, **kwargs: logged.update({name: value}),
+    )
+
+    module.on_before_optimizer_step(optimizer=None)
+
+    assert "train_grad_norm" in logged
+    torch.testing.assert_close(
+        logged["train_grad_norm"],
+        parameter.grad.norm(2),
+    )
+
+
 def test_synthetic_training_step_returns_finite_loss(
     tiny_config_factory,
     monkeypatch,
