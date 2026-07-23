@@ -1,7 +1,30 @@
+from pathlib import Path
+
+import yaml
 from transformers import PretrainedConfig
+
+
+def load_experiment_config(path):
+    path = Path(path)
+    with path.open(encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+
+    if not isinstance(config, dict):
+        raise ValueError(f"experiment config must be a mapping: {path}")
+    if not isinstance(config.get("model"), dict):
+        raise ValueError(f"experiment config must contain a model mapping: {path}")
+    if "training" in config and not isinstance(config["training"], dict):
+        raise ValueError(f"training config must be a mapping: {path}")
+    return config
+
 
 class EnformerConfig(PretrainedConfig):
     model_type = "enformer"
+
+    @classmethod
+    def from_yaml_file(cls, path):
+        experiment_config = load_experiment_config(path)
+        return cls(**experiment_config["model"])
 
     def __init__(
         self,
@@ -27,6 +50,7 @@ class EnformerConfig(PretrainedConfig):
 
         use_rel_pe=False,
         use_einsum=False,
+        attention_backend="auto",
 
         **kwargs,
     ):
@@ -53,6 +77,23 @@ class EnformerConfig(PretrainedConfig):
         self.dim_divisible_by = dim_divisible_by
         self.use_tf_gamma = use_tf_gamma
         self.use_rel_pe = use_rel_pe
-        self.use_einsum = use_einsum
+
+        valid_backends = {"auto", "flex", "sdpa", "einsum"}
+        if attention_backend not in valid_backends:
+            raise ValueError(
+                f"attention_backend must be one of {sorted(valid_backends)}, "
+                f"got {attention_backend!r}"
+            )
+        if use_einsum:
+            if attention_backend not in {"auto", "einsum"}:
+                raise ValueError(
+                    "use_einsum=True conflicts with "
+                    f"attention_backend={attention_backend!r}"
+                )
+            attention_backend = "einsum"
+
+        self.attention_backend = attention_backend
+        # Retain the old flag when reading and writing existing checkpoints.
+        self.use_einsum = attention_backend == "einsum"
 
         super().__init__(**kwargs)

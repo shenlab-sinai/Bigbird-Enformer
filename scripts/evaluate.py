@@ -41,6 +41,13 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BATCH_SIZE = 4
 
+DEFAULT_MODEL_CONFIG_PATH = (
+    Path(project_root) / "configs" / "ccre_bigbird.yaml"
+)
+MODEL_CONFIG_PATH = Path(
+    os.environ.get("ENFORMER_CONFIG", DEFAULT_MODEL_CONFIG_PATH)
+)
+
 PLOT_TRACKS = {
     "DNASE:CD14 (ENCODE)":     45,
     "H3K27ac:HepG2 (ENCODE)": 694,
@@ -238,6 +245,10 @@ class EvalWrapper(pl.LightningModule):
 # Entry point
 
 if __name__ == "__main__":
+    config = EnformerConfig.from_yaml_file(MODEL_CONFIG_PATH)
+    print(f"MODEL_CONFIG = {MODEL_CONFIG_PATH}")
+    print(f"ATTN_BACKEND = {config.attention_backend}")
+
     if USE_OFFICIAL:
         from enformer_pytorch import from_pretrained
         OFFICIAL_ID = os.path.join(project_root, "Official_Enformer")
@@ -248,22 +259,6 @@ if __name__ == "__main__":
     else:
         assert os.path.exists(CKPT_PATH), f"Checkpoint not found: {CKPT_PATH}"
         print(f"Loading checkpoint: {CKPT_PATH}")
-
-        config = EnformerConfig(
-            dim=1536,
-            depth=11,
-            heads=8,
-            output_heads=dict(human=5313, mouse=1643),
-            target_length=896,
-            attention_mode="ccre_bigbird",
-            block_size=128,
-            use_checkpointing=True,
-            attn_dropout=0.05,
-            dropout_rate=0.3,
-            pos_dropout=0.01,
-            use_rel_pe=False,
-            use_einsum = True,
-        )
 
         base_model = load_atlas_checkpoint(CKPT_PATH, model_config=config)
         base_model.eval()

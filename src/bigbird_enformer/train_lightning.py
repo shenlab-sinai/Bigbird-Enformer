@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from .models.enformer_plus import Enformer
-from .utils.config import EnformerConfig
+from .utils.config import EnformerConfig, load_experiment_config
 
 #  Performance monitor
 
@@ -785,7 +785,20 @@ class EnformerDataModule(pl.LightningDataModule):
         return [make_loader(self.val_human), make_loader(self.val_mouse)]
 
 if __name__ == "__main__":
-    pl.seed_everything(42, workers=True)
+    default_config_path = (
+        Path(__file__).resolve().parents[2] / "configs" / "ccre_bigbird.yaml"
+    )
+    config_path = Path(
+        os.environ.get("ENFORMER_CONFIG", default_config_path)
+    )
+    experiment_config = load_experiment_config(config_path)
+    config = EnformerConfig(**experiment_config["model"])
+    training_config = experiment_config["training"]
+    classifier_config = training_config["classifier"]
+    dataloader_config = training_config["dataloader"]
+    trainer_config = dict(training_config["trainer"])
+
+    pl.seed_everything(training_config["seed"], workers=True)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -794,67 +807,42 @@ if __name__ == "__main__":
     HUMAN_NPZ_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/human"
     MOUSE_NPZ_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/enformer-pytorch/data/enformer_flat_npy/mouse"
 
-    CONDITION = "full"   # full | no_pls | no_els | no_ctcf | no_tf | no_ca
-
-    import pandas as pd
+    CONDITION = training_config["ccre_condition"]
+    MEAN_CCRE_K = int(training_config["mean_ccre_k"])
+    CLASSIFIER_EVERY = int(classifier_config["every"])
+    CLASSIFIER_MODE = classifier_config["mode"]
 
     ABLATION_BASE = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/ablation"
     HUMAN_CCRE_MASK_DIR = f"{ABLATION_BASE}/{CONDITION}/human"
     MOUSE_CCRE_MASK_DIR = f"{ABLATION_BASE}/{CONDITION}/mouse"
 
-    # Read mean_ccre_k from the actual mask manifest
-    MEAN_CCRE_K = int(pd.read_csv(f"{HUMAN_CCRE_MASK_DIR}/manifest.csv")["n_ccre_bins"].mean())
-    print(f"CONDITION    = {CONDITION}")
-    print(f"MEAN_CCRE_K  = {MEAN_CCRE_K}")
-
-    # HUMAN_CCRE_MASK_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/human_75pct"
-    # MOUSE_CCRE_MASK_DIR = "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp/Sparse_Enformer/ccre_mask/mouse_75pct"
-
-    MEAN_CCRE_K = 460
-    CLASSIFIER_EVERY = 1
-    CLASSIFIER_MODE = "progressive"  # "progressive" | "cached"
-
+    print(f"MODEL_CONFIG  = {config_path}")
+    print(f"ATTN_BACKEND  = {config.attention_backend}")
+    print(f"CONDITION     = {CONDITION}")
+    print(f"MEAN_CCRE_K   = {MEAN_CCRE_K}")
     print(f"CLASSIFIER_EVERY = {CLASSIFIER_EVERY}")
-    print(f"CLASSIFIER_MODE = {CLASSIFIER_MODE}")
-
-    config = EnformerConfig(
-        dim=1536,
-        depth=11,
-        heads=8,
-        output_heads=dict(human=5313, mouse=1643),
-        target_length=896,
-        attention_mode="ccre_bigbird",
-        block_size=128,
-        use_checkpointing=True,
-        attn_dropout=0.05,
-        dropout_rate=0.3,
-        pos_dropout=0.01,
-        use_rel_pe=False,
-        use_einsum=True,
-    )
+    print(f"CLASSIFIER_MODE  = {CLASSIFIER_MODE}")
 
     dm = EnformerDataModule(
         human_npz_dir=HUMAN_NPZ_DIR,
         mouse_npz_dir=MOUSE_NPZ_DIR,
         human_ccre_mask_dir=HUMAN_CCRE_MASK_DIR,
         mouse_ccre_mask_dir=MOUSE_CCRE_MASK_DIR,
-        train_batch_size=8,
-        val_batch_size=8,
-        num_workers=4,
+        **dataloader_config,
     )
 
     model = BigBirdLightningModule(
         config,
-        lr=5e-4,
-        warmup_steps=5_000,
-        use_classifier=True,
-        classifier_hidden_dims=256,
-        classifier_dropout=0.1,
-        bce_weight=0.1,
+        lr=training_config["learning_rate"],
+        warmup_steps=training_config["warmup_steps"],
+        use_classifier=classifier_config["enabled"],
+        classifier_hidden_dims=classifier_config["hidden_dims"],
+        classifier_dropout=classifier_config["dropout"],
+        bce_weight=classifier_config["bce_weight"],
         mean_ccre_k=MEAN_CCRE_K,
         classifier_every=CLASSIFIER_EVERY,
-        mix_steps=100_000,
-        weight_decay=1e-4,
+        mix_steps=training_config["mix_steps"],
+        weight_decay=training_config["weight_decay"],
         classifier_mode=CLASSIFIER_MODE,
     )
 
@@ -878,28 +866,19 @@ if __name__ == "__main__":
         save_last = False,
     )
 
-    strategy = DDPStrategy(gradient_as_bucket_view=True, find_unused_parameters=True)
+    strategy = DDPStrategy(**training_config["strategy"])
 
     trainer = pl.Trainer(
-        accelerator="gpu",
-        devices = 4,
-        num_nodes = 2,
-        strategy = strategy,
-        max_steps = 150_000,
-        max_epochs = -1,
-        precision = "bf16-mixed",
-        gradient_clip_val = 0.2,
-        gradient_clip_algorithm = "norm",
-        logger = logger,
-        callbacks = [checkpoint_callback, LearningRateMonitor(logging_interval="step"),
-                   PerformanceMonitor(log_every=50)],
-        sync_batchnorm = False,
-        accumulate_grad_batches = 1,
-        log_every_n_steps = 10,
-        enable_model_summary = False,
-        num_sanity_val_steps = 0,
-        val_check_interval = 1000,
-        check_val_every_n_epoch = None,
+        **trainer_config,
+        strategy=strategy,
+        logger=logger,
+        callbacks=[
+            checkpoint_callback,
+            LearningRateMonitor(logging_interval="step"),
+            PerformanceMonitor(
+                log_every=training_config["performance_log_every"]
+            ),
+        ],
     )
 
     trainer.fit(model, dm)

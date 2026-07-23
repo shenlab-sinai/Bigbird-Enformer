@@ -14,9 +14,10 @@ dependencies = [
     "numpy",
     "pandas",
     "pytorch-lightning",
+    "PyYAML",
     "tensorboard",
     "tensorflow",
-    "torch",
+    "torch>=2.5",
     "torchmetrics",
     "transformers",
 ]

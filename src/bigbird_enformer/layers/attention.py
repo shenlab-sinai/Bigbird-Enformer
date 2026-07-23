@@ -2,6 +2,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+
+_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
 
 #  Relative positional encoding helpers
 
@@ -303,6 +307,95 @@ class RelFullAttention(nn.Module):
 
 #  ABSOLUTE PE attention classes 
 
+def _ccre_attention_mask(
+    is_global: torch.Tensor | None,
+    batch_size: int,
+    seq_len: int,
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the union of local-window and global attention positions."""
+    block_ids = torch.arange(seq_len, device=device) // block_size
+    local = (block_ids[:, None] - block_ids[None, :]).abs() <= 1
+
+    if is_global is None:
+        return local.view(1, 1, seq_len, seq_len)
+
+    if is_global.ndim != 2 or is_global.shape != (batch_size, seq_len):
+        raise ValueError(
+            "is_global must have shape [batch, sequence], "
+            f"got {tuple(is_global.shape)}; expected {(batch_size, seq_len)}"
+        )
+
+    is_global = is_global.to(device=device, dtype=torch.bool)
+    allowed = (
+        local.unsqueeze(0)
+        | is_global[:, :, None]
+        | is_global[:, None, :]
+    )
+    return allowed.unsqueeze(1)
+
+
+def _flex_ccre_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_global: torch.Tensor,
+    block_size: int,
+    attention_fn,
+) -> torch.Tensor:
+    """Run cCRE attention after packing global positions into contiguous blocks."""
+    batch_size, heads, seq_len, _ = q.shape
+    value_dim = v.shape[-1]
+
+    permutation = torch.argsort(~is_global, dim=1, stable=True)
+    sorted_is_global = is_global.gather(1, permutation)
+
+    def gather_sequence(tensor):
+        indices = permutation[:, None, :, None].expand(
+            batch_size, tensor.shape[1], seq_len, tensor.shape[-1]
+        )
+        return tensor.gather(2, indices)
+
+    q_sorted = gather_sequence(q)
+    k_sorted = gather_sequence(k)
+    v_sorted = gather_sequence(v)
+
+    def mask_mod(batch, head, query_index, key_index):
+        query_position = permutation[batch, query_index]
+        key_position = permutation[batch, key_index]
+        local = (
+            query_position // block_size - key_position // block_size
+        ).abs() <= 1
+        return (
+            local
+            | sorted_is_global[batch, query_index]
+            | sorted_is_global[batch, key_index]
+        )
+
+    block_mask = create_block_mask(
+        mask_mod,
+        B=batch_size,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=q.device,
+        BLOCK_SIZE=block_size,
+    )
+    out_sorted = attention_fn(
+        q_sorted,
+        k_sorted,
+        v_sorted,
+        block_mask=block_mask,
+    )
+
+    inverse_permutation = permutation.argsort(dim=1)
+    output_indices = inverse_permutation[:, None, :, None].expand(
+        batch_size, heads, seq_len, value_dim
+    )
+    return out_sorted.gather(2, output_indices)
+
+
 class FullAttention(nn.Module):
     def __init__(
         self,
@@ -424,78 +517,23 @@ class BigBirdCCREAttentionEinsum(nn.Module):
         B, N, _ = x.shape
         H, dk, dv = self.heads, self.dim_key, self.dim_value
         BS = self.block_size
-        nb = N // BS
-        assert N % BS == 0
+        assert N % BS == 0, f"N={N} must be divisible by block_size={BS}"
 
         q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)
         k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
         v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
 
-        if is_global is not None and is_global.any():
-            out = self._sparse_forward_einsum(q, k, v, is_global, B, N, H, dk, dv, BS, nb)
-        else:
-            out = self._local_window_einsum(q, k, v, B, N, H, dk, dv, BS, nb)
+        attn_mask = _ccre_attention_mask(is_global, B, N, BS, x.device)
+        scores = torch.einsum("bhid,bhjd->bhij", q, k) * self.scale
+        scores.masked_fill_(~attn_mask, float("-inf"))
+        attn = scores.softmax(dim=-1)
 
+        if self.training and self.dropout_p > 0:
+            attn = self.attn_dropout(attn)
+
+        out = torch.einsum("bhij,bhjd->bhid", attn, v)
         out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
         return self.to_out(out)
-
-    def _sparse_forward_einsum(self, q, k, v, is_global, B, N, H, dk, dv, BS, nb):
-        """Blockified with gathered globals — einsum, no SDPA."""
-        n_globals = is_global[0].sum().item()
-        gidx = is_global.float().topk(n_globals, dim=1).indices.sort(dim=1).values
-
-        idx_k = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dk)
-        idx_v = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dv)
-        k_global = k.gather(2, idx_k)
-        v_global = v.gather(2, idx_v)
-
-        q_blk = q.view(B, H, nb, BS, dk)
-        k_blk = k.view(B, H, nb, BS, dk)
-        v_blk = v.view(B, H, nb, BS, dv)
-
-        zk = k.new_zeros(B, H, 1, BS, dk)
-        zv = v.new_zeros(B, H, 1, BS, dv)
-        k_pad = torch.cat([zk, k_blk, zk], dim=2)
-        v_pad = torch.cat([zv, v_blk, zv], dim=2)
-
-        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
-        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
-
-        kg_exp = k_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)
-        vg_exp = v_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)
-        k_full = torch.cat([kg_exp, k_win], dim=3)  
-        v_full = torch.cat([vg_exp, v_win], dim=3)
-
-        scores = torch.einsum("bhnid,bhnjd->bhnij", q_blk, k_full) * self.scale
-        attn = scores.softmax(dim=-1)
-
-        if self.training and self.dropout_p > 0:
-            attn = self.attn_dropout(attn)
-
-        out = torch.einsum("bhnij,bhnjd->bhnid", attn, v_full)
-        return out.reshape(B, H, N, dv)
-
-    def _local_window_einsum(self, q, k, v, B, N, H, dk, dv, BS, nb):
-        q_blk = q.view(B, H, nb, BS, dk)
-        k_blk = k.view(B, H, nb, BS, dk)
-        v_blk = v.view(B, H, nb, BS, dv)
-
-        zk = k.new_zeros(B, H, 1, BS, dk)
-        zv = v.new_zeros(B, H, 1, BS, dv)
-        k_pad = torch.cat([zk, k_blk, zk], dim=2)
-        v_pad = torch.cat([zv, v_blk, zv], dim=2)
-
-        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
-        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
-
-        scores = torch.einsum("bhnid,bhnjd->bhnij", q_blk, k_win) * self.scale
-        attn = scores.softmax(dim=-1)
-
-        if self.training and self.dropout_p > 0:
-            attn = self.attn_dropout(attn)
-
-        out = torch.einsum("bhnij,bhnjd->bhnid", attn, v_win)
-        return out.reshape(B, H, N, dv)
 
 
 class BigBirdCCREAttention(nn.Module):
@@ -507,13 +545,26 @@ class BigBirdCCREAttention(nn.Module):
         dim_value: int = 64,
         block_size: int = 128,
         dropout: float = 0.0,
+        backend: str = "auto",
         **kwargs,
     ):
         super().__init__()
+        if backend not in {"auto", "flex", "sdpa"}:
+            raise ValueError(
+                "BigBirdCCREAttention backend must be 'auto', 'flex', or "
+                f"'sdpa', got {backend!r}"
+            )
+        if backend in {"auto", "flex"} and dropout:
+            raise ValueError(
+                "FlexAttention does not support post-softmax attention dropout; "
+                "set attn_dropout=0 or attention_backend='sdpa'"
+            )
+
         self.heads      = heads
         self.dim_key    = dim_key
         self.dim_value  = dim_value
         self.block_size = block_size
+        self.backend    = backend
         self.dropout_p  = float(dropout)
         self.inner_v    = heads * dim_value
 
@@ -529,75 +580,56 @@ class BigBirdCCREAttention(nn.Module):
         B, N, _ = x.shape
         H, dk, dv = self.heads, self.dim_key, self.dim_value
         BS = self.block_size
-        nb = N // BS
-        drop = self.dropout_p if self.training else 0.0
         assert N % BS == 0, f"N={N} must be divisible by block_size={BS}"
 
         q = self.to_q(x).view(B, N, H, dk).transpose(1, 2)   # [B, H, N, dk]
         k = self.to_k(x).view(B, N, H, dk).transpose(1, 2)
         v = self.to_v(x).view(B, N, H, dv).transpose(1, 2)
 
-        if is_global is not None and is_global.any():
-            out = self._sparse_forward(q, k, v, is_global, B, N, H, dk, dv, BS, nb, drop)
-        else:
-            out = self._local_window_forward(q, k, v, B, N, H, dk, dv, BS, nb, drop)
+        use_flex = self.backend == "flex" or (
+            self.backend == "auto" and x.device.type == "cuda"
+        )
+        if self.backend == "flex" and x.device.type != "cuda":
+            raise RuntimeError(
+                "attention_backend='flex' requires CUDA; use 'auto' for an "
+                "SDPA fallback on CPU/MPS"
+            )
 
+        if not use_flex:
+            attn_mask = _ccre_attention_mask(is_global, B, N, BS, x.device)
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False,
+            )
+            out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
+            return self.to_out(out)
+
+        if is_global is None:
+            is_global = torch.zeros(B, N, dtype=torch.bool, device=x.device)
+        elif is_global.ndim != 2 or is_global.shape != (B, N):
+            raise ValueError(
+                "is_global must have shape [batch, sequence], "
+                f"got {tuple(is_global.shape)}; expected {(B, N)}"
+            )
+        else:
+            is_global = is_global.to(device=x.device, dtype=torch.bool)
+
+        # Packing globals makes the union block-sparse while retaining every
+        # original query and key exactly once.
+        out = _flex_ccre_attention(
+            q,
+            k,
+            v,
+            is_global,
+            BS,
+            _compiled_flex_attention,
+        )
         out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)
         return self.to_out(out)
-
-    def _sparse_forward(self, q, k, v, is_global, B, N, H, dk, dv, BS, nb, drop):
-        n_globals = is_global[0].sum().item()
-        gidx = is_global.float().topk(n_globals, dim=1).indices.sort(dim=1).values  # [B, k]
-
-        idx_k = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dk)
-        idx_v = gidx.unsqueeze(1).unsqueeze(-1).expand(B, H, n_globals, dv)
-        k_global = k.gather(2, idx_k)   # [B, H, k, dk]
-        v_global = v.gather(2, idx_v)   # [B, H, k, dv]
-
-        q_blk = q.view(B, H, nb, BS, dk)
-        k_blk = k.view(B, H, nb, BS, dk)
-        v_blk = v.view(B, H, nb, BS, dv)
-
-        zk = k.new_zeros(B, H, 1, BS, dk)
-        zv = v.new_zeros(B, H, 1, BS, dv)
-        k_pad = torch.cat([zk, k_blk, zk], dim=2)
-        v_pad = torch.cat([zv, v_blk, zv], dim=2)
-
-        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
-        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
-
-        kg_exp = k_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)   # [B, H, nb, k, dk]
-        vg_exp = v_global.unsqueeze(2).expand(-1, -1, nb, -1, -1)
-        k_full = torch.cat([kg_exp, k_win], dim=3)   # [B, H, nb, k+3*BS, dk]
-        v_full = torch.cat([vg_exp, v_win], dim=3)
-
-        L_kv = n_globals + 3 * BS
-        q_flat = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,   dk)
-        k_flat = k_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, L_kv, dk)
-        v_flat = v_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, L_kv, dv)
-
-        out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
-        return out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
-
-    def _local_window_forward(self, q, k, v, B, N, H, dk, dv, BS, nb, drop):
-        q_blk = q.view(B, H, nb, BS, dk)
-        k_blk = k.view(B, H, nb, BS, dk)
-        v_blk = v.view(B, H, nb, BS, dv)
-
-        zk = k.new_zeros(B, H, 1, BS, dk)
-        zv = v.new_zeros(B, H, 1, BS, dv)
-        k_pad = torch.cat([zk, k_blk, zk], dim=2)
-        v_pad = torch.cat([zv, v_blk, zv], dim=2)
-
-        k_win = torch.cat([k_pad[:, :, 0:nb], k_pad[:, :, 1:nb+1], k_pad[:, :, 2:nb+2]], dim=3)
-        v_win = torch.cat([v_pad[:, :, 0:nb], v_pad[:, :, 1:nb+1], v_pad[:, :, 2:nb+2]], dim=3)
-
-        q_flat = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,     dk)
-        k_flat = k_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dk)
-        v_flat = v_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dv)
-
-        out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
-        return out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
 
 
 class BigBirdAttention(nn.Module):

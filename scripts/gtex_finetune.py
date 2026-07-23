@@ -27,6 +27,15 @@ from bigbird_enformer.utils.config import EnformerConfig
 from bigbird_enformer.utils.gtex_dataset import GTExConsensusDataset, gtex_collate_fn
 
 
+DEFAULT_MODEL_CONFIG_PATH = (
+    Path(project_root) / "configs" / "ccre_bigbird.yaml"
+)
+MODEL_CONFIG_PATH = Path(
+    os.environ.get("ENFORMER_CONFIG", DEFAULT_MODEL_CONFIG_PATH)
+)
+MODEL_CONFIG = EnformerConfig.from_yaml_file(MODEL_CONFIG_PATH)
+
+
 CKPT_PATH = (
     "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp"
     "/Sparse_Enformer/tb_logs/ATLAS-Ablation"
@@ -34,7 +43,7 @@ CKPT_PATH = (
     "/ccre_cls-best-epoch=133-val_corr_coef=0.6751.ckpt"
 )
 
-attention_mode = "ccre_bigbird"
+attention_mode = MODEL_CONFIG.attention_mode
 seq_len        = 196_608
 mean_ccre_k    = 153
 
@@ -97,20 +106,6 @@ run_name = (
     f"-{seq_len//1024}k-{mean_ccre_k}-fold{FOLD}"
 )
 
-_MODEL_CONFIG = dict(
-    dim=1536, depth=11, heads=8,
-    output_heads=dict(human=5313, mouse=1643),
-    target_length=896,
-    block_size=128,
-    use_checkpointing=True,
-    attn_dropout=0.05,
-    dropout_rate=0.3,
-    pos_dropout=0.01,
-    use_rel_pe=False,
-    use_einsum=True,
-)
-
-
 def mse_ignore_nan(pred, target):
     mask = torch.isfinite(target)
     if not mask.any():
@@ -159,7 +154,7 @@ class GTExFinetuneModule(pl.LightningModule):
         self.model       = model
         self.classifiers = classifiers
         self.is_ccre     = (attention_mode == "ccre_bigbird")
-        self.gtex_head   = GTExHead(_MODEL_CONFIG["dim"] * 2, n_tissues, head_dropout)
+        self.gtex_head   = GTExHead(MODEL_CONFIG.dim * 2, n_tissues, head_dropout)
         self.register_buffer("ccre_mask", ccre_mask.bool())
 
         self._val_preds      = []
@@ -447,7 +442,9 @@ def main():
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
-    config = EnformerConfig(**{**_MODEL_CONFIG, "attention_mode": attention_mode})
+    config = EnformerConfig.from_dict(MODEL_CONFIG.to_dict())
+    print(f"MODEL_CONFIG = {MODEL_CONFIG_PATH}")
+    print(f"ATTN_BACKEND = {config.attention_backend}")
     model, classifiers = load_pretrained(CKPT_PATH, config)
 
     sample_names, exp_values, n_tissues = load_gtex_expression(gene_id)

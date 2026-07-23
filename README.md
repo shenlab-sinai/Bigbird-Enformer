@@ -43,6 +43,25 @@ BigBird attention replaces full attention with a structured sparse pattern consi
 
 This preserves long-range communication while keeping computation near linear.
 
+The cCRE-guided BigBird mode uses compiled PyTorch FlexAttention on CUDA.
+Selected cCRE positions are packed into contiguous blocks before attention, and
+the mask is the union of local keys, global queries, and global keys. Each
+original key therefore appears exactly once. FlexAttention does not provide
+post-softmax attention dropout, so this mode requires `attn_dropout=0`; the
+model's residual and feed-forward dropout remain available.
+
+Model and training settings are stored in `configs/ccre_bigbird.yaml`, under
+separate `model` and `training` sections. The model
+`attention_backend` setting accepts:
+
+- `"auto"` (default): FlexAttention on CUDA and SDPA on CPU/MPS.
+- `"flex"`: require compiled FlexAttention on CUDA.
+- `"sdpa"`: use masked scaled-dot-product attention on every device.
+- `"einsum"`: use the dense explicit reference implementation.
+
+Set `ENFORMER_CONFIG=/path/to/config.yaml` to run the training, evaluation, or
+GTEx fine-tuning scripts with another model configuration.
+
 ### 3. Hierarchical Sparse Attention
 
 This project introduces a custom **hierarchical sparse attention** pattern.
@@ -125,9 +144,9 @@ python -m pytest tests/test_attention.py
 python -m pytest tests/test_model.py::test_model_accepts_indices_and_one_hot
 ```
 
-The cCRE sparse-attention tests use fixed top-k masks, matching the production
-design: every sample has the same number of global tokens while their positions
-can differ, allowing efficient batched GPU execution.
+The cCRE sparse-attention implementation supports different numbers and
+positions of global cCRE tokens in each sample. CPU and MPS use a dense Boolean
+reference path because compiled FlexAttention backward is CUDA-only.
 
 Run the standalone evaluation and GTEx fine-tuning workflows with:
 

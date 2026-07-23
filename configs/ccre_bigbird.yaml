@@ -1,0 +1,91 @@
+model:
+  dim: 1536
+  depth: 11
+  heads: 8
+  output_heads:
+    human: 5313
+    mouse: 1643
+  target_length: 896
+
+  # Attention mode choices:
+  #   ccre_bigbird: local blocks plus selected cCRE positions as global tokens
+  #   full: full self-attention over all positions
+  #   bigbird: local blocks plus one learned global token
+  #   bigbird_ablation: local block-window attention without global tokens
+  #   block_sparse: hierarchical chunk-based sparse attention
+  attention_mode: ccre_bigbird
+
+  # Attention backend choices:
+  #   auto: FlexAttention on CUDA and SDPA on CPU/MPS (default)
+  #   flex: require CUDA FlexAttention
+  #   sdpa: force masked SDPA on every device
+  #   einsum: dense reference implementation
+  attention_backend: auto
+
+  block_size: 128
+  use_checkpointing: true
+  attn_dropout: 0.0
+  dropout_rate: 0.3
+  pos_dropout: 0.01
+  use_rel_pe: false
+
+training:
+  seed: 888 # good feng-shui
+  learning_rate: 0.0005
+  warmup_steps: 5000
+  weight_decay: 0.0001
+  mix_steps: 100000
+
+  ccre_condition: full
+  mean_ccre_k: 460
+
+  classifier:
+    enabled: true
+    hidden_dims: 256
+    dropout: 0.1
+    bce_weight: 0.1
+    every: 1
+    mode: progressive
+
+  dataloader:
+    train_batch_size: 8
+    val_batch_size: 8
+    num_workers: 4
+
+  trainer:
+    accelerator: gpu
+    devices: 4
+    num_nodes: 2
+    max_steps: 150000
+    max_epochs: -1
+
+    # Lightning precision choices:
+    #   bf16-mixed: BF16 compute with FP32 weights; recommended on A100/L40S or newer
+    #   16-mixed: FP16 compute with FP32 weights; use for V100 or GPUs without BF16
+    #   32-true: full FP32 training; most compatible, but slower and uses more memory
+    #   bf16-true: model weights and compute in BF16
+    #   16-true: model weights and compute in FP16; least numerically robust
+    #   64-true: full FP64 training; mainly for numerical debugging
+    #   transformer-engine: NVIDIA Transformer Engine FP8 mixed precision
+    #   transformer-engine-float16: Transformer Engine with FP16 higher precision
+    precision: bf16-mixed
+
+    gradient_clip_val: 0.2
+    gradient_clip_algorithm: norm
+    accumulate_grad_batches: 1
+    log_every_n_steps: 10
+    enable_model_summary: false
+    num_sanity_val_steps: 0
+    val_check_interval: 1000
+    check_val_every_n_epoch: null
+
+    # Keep false when each GPU has enough samples for stable local BatchNorm.
+    # Set true only if small per-GPU batches make BatchNorm statistics unstable;
+    # synchronization adds communication overhead, especially across nodes.
+    sync_batchnorm: false
+
+  strategy:
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+  performance_log_every: 50

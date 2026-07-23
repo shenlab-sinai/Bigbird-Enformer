@@ -8,7 +8,7 @@ Changes from original:
   - use_rel_pe=True  (default): Transformer-XL relative PE inside attention.
     Positional embedding is nn.Identity() for ccre_bigbird and full modes.
   - use_rel_pe=False: Sinusoidal absolute PE added before transformer.
-    Attention uses SDPA (bf16, flash-attention eligible).
+    cCRE attention uses FlexAttention; full attention uses SDPA.
 """
 
 import math
@@ -26,7 +26,7 @@ from einops.layers.torch import Rearrange
 from ..utils.data import str_to_one_hot, seq_indices_to_one_hot
 from ..utils.config import EnformerConfig
 from ..layers.attention import (
-    # Abs PE + SDPA (fast)
+    # Abs PE + FlexAttention/SDPA (fast)
     FullAttention,
     BigBirdCCREAttention,
     # Abs PE + Einsum (no FlashAttention)
@@ -235,7 +235,12 @@ class Enformer(PreTrainedModel):
 
         # ── use_rel_pe flag (default True for backward compat) ──
         self.use_rel_pe = getattr(config, "use_rel_pe", False)
-        self.use_einsum = getattr(config, "use_einsum", False)
+        self.attention_backend = getattr(
+            config,
+            "attention_backend",
+            "einsum" if getattr(config, "use_einsum", False) else "auto",
+        )
+        self.use_einsum = self.attention_backend == "einsum"
 
         # Stem
         self.stem = nn.Sequential(
@@ -349,13 +354,13 @@ class Enformer(PreTrainedModel):
                 max_seq_len=seq_len_trans,
             )
         elif self.use_einsum:
-            # Abs PE + einsum 
+            # Abs PE + dense einsum reference
             attn_cls   = BigBirdCCREAttentionEinsum
             attn_extra = {}
         else:
-            # Abs PE + SDPA 
+            # Abs PE + configurable FlexAttention/SDPA backend
             attn_cls   = BigBirdCCREAttention
-            attn_extra = {}
+            attn_extra = {"backend": self.attention_backend}
 
         return nn.ModuleList([
             TransformerBlock(
@@ -396,11 +401,17 @@ class Enformer(PreTrainedModel):
                         dim_key=config.attn_dim_key, dim_value=config.attn_dim_value,
                         dropout=config.attn_dropout,
                     )
-                else:
+                elif self.attention_backend in {"auto", "sdpa"}:
                     attn_layer = FullAttention(
                         dim=config.dim, heads=config.heads,
                         dim_key=config.attn_dim_key, dim_value=config.attn_dim_value,
                         dropout=config.attn_dropout,
+                    )
+                else:
+                    raise ValueError(
+                        "full attention supports attention_backend='auto', "
+                        "'sdpa', or 'einsum'; FlexAttention is only available "
+                        "for ccre_bigbird"
                     )
             elif self.attention_mode == "bigbird_ablation":
                 attn_layer = BigBirdAttentionAblation(

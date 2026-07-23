@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from bigbird_enformer.layers.attention import (
+    _flex_ccre_attention,
     BigBirdAttention,
     BigBirdAttentionAblation,
     BigBirdCCREAttention,
@@ -13,6 +14,7 @@ from bigbird_enformer.layers.attention import (
     RelFullAttention,
     get_positional_embed,
 )
+from torch.nn.attention.flex_attention import flex_attention
 from bigbird_enformer.models.enformer_plus import (
     ChunkGlobalTokenInjector,
     ChunkGlobalTokenRemover,
@@ -112,7 +114,7 @@ def _randomize_output_projection(layer):
     ids=[
         "full-sdpa",
         "full-einsum",
-        "ccre-sdpa",
+        "ccre-flex",
         "ccre-einsum",
         "bigbird-global-token",
         "block-sparse",
@@ -164,8 +166,8 @@ def test_full_sdpa_matches_einsum():
     ],
     ids=["local-only", "equal-global-counts"],
 )
-def test_ccre_sdpa_matches_einsum(mask):
-    sdpa = BigBirdCCREAttention(
+def test_ccre_flex_matches_dense_einsum_reference(mask):
+    flex = BigBirdCCREAttention(
         12,
         heads=2,
         dim_key=4,
@@ -179,19 +181,153 @@ def test_ccre_sdpa_matches_einsum(mask):
         dim_value=4,
         block_size=4,
     ).eval()
-    _randomize_output_projection(sdpa)
-    einsum.load_state_dict(sdpa.state_dict())
+    _randomize_output_projection(flex)
+    einsum.load_state_dict(flex.state_dict())
     inputs = torch.randn(2, 8, 12)
 
     torch.testing.assert_close(
-        sdpa(inputs, is_global=mask),
+        flex(inputs, is_global=mask),
         einsum(inputs, is_global=mask),
         rtol=1e-5,
         atol=1e-6,
     )
 
 
-def test_ccre_attention_batches_fixed_topk_masks_correctly():
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: BigBirdCCREAttention(
+            12,
+            heads=2,
+            dim_key=4,
+            dim_value=4,
+            block_size=2,
+        ),
+        lambda: BigBirdCCREAttentionEinsum(
+            12,
+            heads=2,
+            dim_key=4,
+            dim_value=4,
+            block_size=2,
+        ),
+    ],
+    ids=["flex", "einsum"],
+)
+def test_ccre_attention_matches_dense_union_of_local_and_global_keys(factory):
+    torch.manual_seed(0)
+    layer = factory().eval()
+    _randomize_output_projection(layer)
+    inputs = torch.randn(2, 8, 12)
+    is_global = torch.tensor(
+        [
+            [False, True, False, False, False, False, False, False],
+            [False, False, False, True, False, False, False, True],
+        ]
+    )
+
+    batch_size, seq_len, _ = inputs.shape
+    q = layer.to_q(inputs).view(
+        batch_size, seq_len, layer.heads, layer.dim_key
+    ).transpose(1, 2)
+    k = layer.to_k(inputs).view(
+        batch_size, seq_len, layer.heads, layer.dim_key
+    ).transpose(1, 2)
+    v = layer.to_v(inputs).view(
+        batch_size, seq_len, layer.heads, layer.dim_value
+    ).transpose(1, 2)
+
+    block_ids = torch.arange(seq_len) // layer.block_size
+    local = (block_ids[:, None] - block_ids[None, :]).abs() <= 1
+    allowed = (
+        local.unsqueeze(0)
+        | is_global[:, :, None]
+        | is_global[:, None, :]
+    )
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=allowed.unsqueeze(1),
+        dropout_p=0.0,
+    )
+    reference = reference.transpose(1, 2).contiguous().view(
+        batch_size, seq_len, layer.inner_v
+    )
+    reference = layer.to_out(reference)
+
+    # Position 1 is both global and local to query 2, but the union has six keys.
+    assert allowed[0, 2].sum().item() == 6
+    torch.testing.assert_close(
+        layer(inputs, is_global=is_global),
+        reference,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_flex_ccre_kernel_matches_dense_union_reference():
+    torch.manual_seed(0)
+    layer = BigBirdCCREAttention(
+        12,
+        heads=2,
+        dim_key=4,
+        dim_value=4,
+        block_size=2,
+    ).eval()
+    inputs = torch.randn(2, 8, 12)
+    is_global = torch.tensor(
+        [
+            [False, True, False, False, False, False, False, False],
+            [False, False, False, True, False, False, False, True],
+        ]
+    )
+
+    batch_size, seq_len, _ = inputs.shape
+    observed_sparsity = []
+
+    def reference_flex_attention(q, k, v, *, block_mask):
+        observed_sparsity.append(block_mask.sparsity())
+        return flex_attention(q, k, v, block_mask=block_mask)
+
+    with torch.no_grad():
+        q = layer.to_q(inputs).view(
+            batch_size, seq_len, layer.heads, layer.dim_key
+        ).transpose(1, 2)
+        k = layer.to_k(inputs).view(
+            batch_size, seq_len, layer.heads, layer.dim_key
+        ).transpose(1, 2)
+        v = layer.to_v(inputs).view(
+            batch_size, seq_len, layer.heads, layer.dim_value
+        ).transpose(1, 2)
+
+        block_ids = torch.arange(seq_len) // layer.block_size
+        local = (block_ids[:, None] - block_ids[None, :]).abs() <= 1
+        allowed = (
+            local.unsqueeze(0)
+            | is_global[:, :, None]
+            | is_global[:, None, :]
+        )
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=allowed.unsqueeze(1),
+            dropout_p=0.0,
+        )
+        actual = _flex_ccre_attention(
+            q,
+            k,
+            v,
+            is_global,
+            layer.block_size,
+            reference_flex_attention,
+        )
+
+    assert observed_sparsity[0] > 0
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+
+
+def test_ccre_attention_batches_variable_global_counts_correctly():
     layer = BigBirdCCREAttention(
         12,
         heads=2,
@@ -204,7 +340,7 @@ def test_ccre_attention_batches_fixed_topk_masks_correctly():
     mask = torch.tensor(
         [
             [True, False, False, False, True, False, False, False],
-            [False, True, False, False, False, True, False, False],
+            [False, True, False, False, False, False, False, False],
         ]
     )
 
@@ -217,6 +353,49 @@ def test_ccre_attention_batches_fixed_topk_masks_correctly():
     )
 
     torch.testing.assert_close(batched, separate)
+
+
+def test_ccre_flex_rejects_attention_dropout():
+    with pytest.raises(ValueError, match="does not support.*attention dropout"):
+        BigBirdCCREAttention(
+            12,
+            heads=2,
+            dim_key=4,
+            dim_value=4,
+            block_size=4,
+            dropout=0.05,
+        )
+
+
+def test_ccre_sdpa_backend_supports_attention_dropout():
+    layer = BigBirdCCREAttention(
+        12,
+        heads=2,
+        dim_key=4,
+        dim_value=4,
+        block_size=4,
+        dropout=0.05,
+        backend="sdpa",
+    )
+
+    output = layer(torch.randn(2, 8, 12))
+
+    assert output.shape == (2, 8, 12)
+    assert torch.isfinite(output).all()
+
+
+def test_ccre_flex_backend_requires_cuda():
+    layer = BigBirdCCREAttention(
+        12,
+        heads=2,
+        dim_key=4,
+        dim_value=4,
+        block_size=4,
+        backend="flex",
+    )
+
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        layer(torch.randn(2, 8, 12))
 
 
 def test_attention_rejects_non_divisible_sequence_length():

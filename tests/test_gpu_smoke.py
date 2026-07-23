@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from bigbird_enformer.layers.attention import BigBirdCCREAttention
 from bigbird_enformer.models.enformer_plus import Enformer
 
 
@@ -59,6 +60,31 @@ def test_cuda_bfloat16_autocast(tiny_config_factory):
 
     assert output.dtype == torch.bfloat16
     assert torch.isfinite(output).all()
+
+
+@pytest.mark.gpu
+@requires_cuda
+def test_cuda_flex_ccre_attention_forward_backward():
+    layer = BigBirdCCREAttention(
+        16,
+        heads=2,
+        dim_key=8,
+        dim_value=8,
+        block_size=128,
+        dropout=0.0,
+    ).cuda()
+    inputs = torch.randn(2, 256, 16, device="cuda", requires_grad=True)
+    is_global = torch.zeros(2, 256, dtype=torch.bool, device="cuda")
+    is_global[0, [1, 129]] = True
+    is_global[1, [64, 200]] = True
+
+    output = layer(inputs, is_global=is_global)
+    output.square().mean().backward()
+
+    assert output.shape == inputs.shape
+    assert torch.isfinite(output).all()
+    assert inputs.grad is not None
+    assert torch.isfinite(inputs.grad).all()
 
 
 @pytest.mark.integration
