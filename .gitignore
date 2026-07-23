@@ -3,6 +3,7 @@
 dataset/
 wandb/
 tb_logs/
+tmp/
 
 # Files:
 poetry.lock
