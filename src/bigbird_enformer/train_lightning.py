@@ -305,6 +305,10 @@ class BigBirdLightningModule(pl.LightningModule):
             routing_gt_mask = None
 
         for i, classifier in enumerate(self.classifiers):
+            # Stop gradients from the auxiliary cCRE-classification loss from
+            # propagating into the shared sequence representations. Allowing this
+            # gradient path caused unstable joint training in preliminary experiments.
+            # The classifier itself is still trained by the classification loss.
             logits = classifier(x.detach())
             all_logits.append(logits)
 
