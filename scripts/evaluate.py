@@ -11,12 +11,12 @@ from pathlib import Path
 import pandas as pd
 
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_script_dir))
-sys.path.insert(0, project_root)
+project_root = os.path.dirname(current_script_dir)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from src.train_lightning import BigBirdLightningModule, SingleOrganismDataset
-from src.utils.config import EnformerConfig
-from src.utils.checkpoint_loading import load_atlas_checkpoint
+from bigbird_enformer.train_lightning import BigBirdLightningModule, SingleOrganismDataset
+from bigbird_enformer.utils.config import EnformerConfig
+from bigbird_enformer.utils.checkpoint_loading import load_atlas_checkpoint
 
 # Configuration
 

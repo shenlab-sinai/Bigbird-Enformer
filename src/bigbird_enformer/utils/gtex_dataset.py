@@ -11,7 +11,7 @@ from cyvcf2 import VCF
 from pyfaidx import Fasta
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
-from src.utils.ccre_mask_utils import generate_ccre_mask
+from .ccre_mask_utils import generate_ccre_mask
 
 _GINFO_PATH = Path(
     "/sc/arion/projects/Nestlerlab/shenl03_ml/gene_exp"

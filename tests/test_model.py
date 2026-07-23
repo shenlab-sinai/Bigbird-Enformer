@@ -2,14 +2,13 @@ import sys
 import os
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-src_folder = os.path.dirname(current_dir)      
-project_root = os.path.dirname(src_folder)    
-sys.path.insert(0, project_root)
+project_root = os.path.dirname(current_dir)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
 
 import torch
-from src.models.enformer_plus import Enformer
-from src.utils.config import EnformerConfig
+from bigbird_enformer.models.enformer_plus import Enformer
+from bigbird_enformer.utils.config import EnformerConfig
 
 def test_enformer_shapes():
     """
@@ -22,7 +21,6 @@ def test_enformer_shapes():
         output_heads=dict(human=5),
         target_length=10,
         block_size=64,
-        dna_chunk_len=128,
         dim_divisible_by=8,
     )
 
@@ -36,7 +34,10 @@ def test_enformer_shapes():
 
     with torch.no_grad():
         output = model(x)
-        
+
+    assert set(output) == {"human"}
+    assert output["human"].shape == (1, 10, 5)
+
     print("Output Keys:", output.keys())
     print("Output Shape:", output['human'].shape)
     

@@ -18,13 +18,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Subset
 
 current_dir  = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_dir))
-sys.path.insert(0, project_root)
+project_root = os.path.dirname(current_dir)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from src.models.enformer_plus import Enformer
-from src.train_lightning import CCREClassifierHead
-from src.utils.config import EnformerConfig
-from src.utils.gtex_dataset import GTExConsensusDataset, gtex_collate_fn
+from bigbird_enformer.models.enformer_plus import Enformer
+from bigbird_enformer.train_lightning import CCREClassifierHead
+from bigbird_enformer.utils.config import EnformerConfig
+from bigbird_enformer.utils.gtex_dataset import GTExConsensusDataset, gtex_collate_fn
 
 
 CKPT_PATH = (

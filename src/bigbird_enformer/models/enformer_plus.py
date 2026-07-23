@@ -1,5 +1,5 @@
 """
-src/models/enformer_plus.py
+src/bigbird_enformer/models/enformer_plus.py
 
 Adapted from enformer-pytorch by lucidrains.
 https://github.com/lucidrains/enformer-pytorch
@@ -11,11 +11,8 @@ Changes from original:
     Attention uses SDPA (bf16, flash-attention eligible).
 """
 
-import sys
-import os
 import math
 import time
-from pathlib import Path
 
 import torch
 from torch import nn
@@ -26,14 +23,9 @@ from torch.utils.checkpoint import checkpoint_sequential, checkpoint
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
-current_dir  = os.path.dirname(os.path.abspath(__file__))
-src_folder   = os.path.dirname(current_dir)
-project_root = os.path.dirname(src_folder)
-sys.path.insert(0, project_root)
-
-from src.utils.data import str_to_one_hot, seq_indices_to_one_hot
-from src.utils.config import EnformerConfig
-from src.layers.attention import (
+from ..utils.data import str_to_one_hot, seq_indices_to_one_hot
+from ..utils.config import EnformerConfig
+from ..layers.attention import (
     # Abs PE + SDPA (fast)
     FullAttention,
     BigBirdCCREAttention,

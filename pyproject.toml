@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bigbird-enformer"
+version = "0.1.0"
+description = "Sparse-attention Enformer models for long genomic sequences"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "einops",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "pytorch-lightning",
+    "tensorboard",
+    "tensorflow",
+    "torch",
+    "torchmetrics",
+    "transformers",
+]
+
+[project.optional-dependencies]
+gtex = [
+    "cyvcf2",
+    "pyfaidx",
+    "scikit-learn",
+    "scipy",
+    "tqdm",
+]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

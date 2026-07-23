@@ -48,3 +48,31 @@ This preserves long-range communication while keeping computation near linear.
 This project introduces a custom **hierarchical sparse attention** pattern.
 
 The sequence is divided into a configurable number of chunks
+
+## Repository layout
+
+```text
+src/bigbird_enformer/  # importable model, layer, training, and utility code
+tests/                 # pytest tests
+scripts/               # evaluation and fine-tuning entry points
+```
+
+Install the package and its test dependencies into the active environment:
+
+```bash
+python -m pip install -e ".[test,gtex]"
+```
+
+Run the test suite from the repository root:
+
+```bash
+python -m pytest
+```
+
+Run the standalone evaluation and GTEx fine-tuning workflows with:
+
+```bash
+python -m bigbird_enformer.train_lightning
+python scripts/evaluate.py
+GTEX_FOLD=0 python scripts/gtex_finetune.py
+```

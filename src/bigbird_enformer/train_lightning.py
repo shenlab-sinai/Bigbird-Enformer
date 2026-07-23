@@ -1,5 +1,4 @@
 import os
-import sys
 import glob
 import time
 import numpy as np
@@ -22,12 +21,8 @@ import matplotlib.pyplot as plt
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-sys.path.insert(0, project_root)
-
-from src.models.enformer_plus import Enformer
-from src.utils.config import EnformerConfig
+from .models.enformer_plus import Enformer
+from .utils.config import EnformerConfig
 
 #  Performance monitor
 
