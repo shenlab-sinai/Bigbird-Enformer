@@ -78,6 +78,19 @@ def test_lightning_module_rejects_unsafe_cached_classifier_mode(
         )
 
 
+def test_resolved_ccre_selection_is_saved_in_checkpoint_hparams(
+    tiny_config_factory,
+):
+    module = BigBirdLightningModule(
+        tiny_config_factory(attention_mode="ccre_bigbird"),
+        mean_ccre_k=137,
+        ccre_condition="no_ctcf",
+    )
+
+    assert module.hparams["mean_ccre_k"] == 137
+    assert module.hparams["ccre_condition"] == "no_ctcf"
+
+
 def test_optimizer_separates_decay_and_no_decay_parameters(tiny_config_factory):
     module = BigBirdLightningModule(
         tiny_config_factory(),

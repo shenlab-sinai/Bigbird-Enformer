@@ -177,7 +177,8 @@ class BigBirdLightningModule(pl.LightningModule):
         classifier_hidden_dims=(384, 96),
         classifier_dropout=0.1,
         bce_weight=0.1,
-        mean_ccre_k=460,
+        mean_ccre_k=None,
+        ccre_condition=None,
         classifier_every=3,
         mix_steps=100_000,
         weight_decay=1e-4,
@@ -200,7 +201,17 @@ class BigBirdLightningModule(pl.LightningModule):
         self.is_ccre_mode = (model_config.attention_mode == "ccre_bigbird")
         self.use_classifier = use_classifier and self.is_ccre_mode
         self.bce_weight = float(bce_weight)
-        self.mean_ccre_k = int(mean_ccre_k)
+        self.mean_ccre_k = (
+            None if mean_ccre_k is None else int(mean_ccre_k)
+        )
+        self.ccre_condition = ccre_condition
+        if self.use_classifier and (
+            self.mean_ccre_k is None or self.mean_ccre_k < 1
+        ):
+            raise ValueError(
+                "mean_ccre_k must be a positive user-configured value "
+                "when the cCRE classifier is enabled"
+            )
         self.classifier_every = int(classifier_every)
         self.mix_steps = int(mix_steps)
         self.weight_decay = float(weight_decay)
@@ -886,6 +897,7 @@ if __name__ == "__main__":
         classifier_dropout=classifier_config["dropout"],
         bce_weight=classifier_config["bce_weight"],
         mean_ccre_k=MEAN_CCRE_K,
+        ccre_condition=CONDITION,
         classifier_every=CLASSIFIER_EVERY,
         mix_steps=training_config["mix_steps"],
         weight_decay=training_config["weight_decay"],

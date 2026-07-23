@@ -37,6 +37,7 @@ training:
   mix_steps: 100000
 
   ccre_condition: full
+  # Fixed number of positions selected by top-k; choose any positive integer.
   mean_ccre_k: 460
 
   classifier:

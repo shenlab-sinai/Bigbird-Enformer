@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from bigbird_enformer.utils.config import EnformerConfig
+from bigbird_enformer.utils.config import EnformerConfig, load_experiment_config
 
 
 @pytest.mark.parametrize(
@@ -71,3 +71,17 @@ def test_repository_ccre_config_loads_with_auto_backend():
     assert config.attention_mode == "ccre_bigbird"
     assert config.attention_backend == "auto"
     assert config.attn_dropout == 0.0
+
+
+def test_repository_ccre_config_exposes_topk_parameter():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "ccre_bigbird.yaml"
+    )
+
+    experiment_config = load_experiment_config(config_path)
+    topk_k = experiment_config["training"]["mean_ccre_k"]
+
+    assert isinstance(topk_k, int)
+    assert topk_k > 0
