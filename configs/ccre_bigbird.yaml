@@ -45,6 +45,7 @@ training:
     dropout: 0.1
     bce_weight: 0.1
     every: 1
+    # Supported: progressive. Cached mode is unsafe without persistent sequence IDs.
     mode: progressive
 
   dataloader:

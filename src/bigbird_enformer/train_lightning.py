@@ -162,19 +162,10 @@ class BigBirdLightningModule(pl.LightningModule):
     """
     Enformer + BigBird sparse attention trained with cCRE global tokens.
 
-    classifier_mode
-
-    progressive
+    classifier_mode="progressive"
         One classifier per every `classifier_every` transformer blocks.
         Each classifier predicts the attention mask for its own block group
         on-the-fly during the forward pass.
-
-    cached
-        One classifier placed AFTER all 11 transformer blocks.
-        The classifier sees the full transformer output and its predictions
-        are cached to generate the attention mask at the NEXT training step.
-        Step 0: pure GT mask (no cache yet).
-        Step 1+: blend GT logits with cached logits via curriculum schedule.
     """
 
     def __init__(
@@ -190,13 +181,17 @@ class BigBirdLightningModule(pl.LightningModule):
         classifier_every=3,
         mix_steps=100_000,
         weight_decay=1e-4,
-        classifier_mode="progressive",  # progressive | cached
+        classifier_mode="progressive",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model_config"])
 
-        assert classifier_mode in ("progressive", "cached"), \
-            f"classifier_mode must be 'progressive' or 'cached', got {classifier_mode!r}"
+        if classifier_mode != "progressive":
+            raise ValueError(
+                "classifier_mode must be 'progressive'; cached mode was removed "
+                "because its logits were not keyed by sequence identity, got "
+                f"{classifier_mode!r}"
+            )
         assert classifier_every >= 1, "classifier_every must be >= 1"
 
         self.model = Enformer(model_config)
@@ -212,12 +207,9 @@ class BigBirdLightningModule(pl.LightningModule):
         self.classifier_mode = classifier_mode
         self.depth = int(model_config.depth)
 
-        # Number of classifiers depends on mode
         self.n_classifiers = (
-            1
-            if classifier_mode == "cached"
-            else (self.depth + self.classifier_every - 1) // self.classifier_every
-        )
+            self.depth + self.classifier_every - 1
+        ) // self.classifier_every
 
         if self.use_classifier:
             self.classifiers = nn.ModuleList([
@@ -239,10 +231,6 @@ class BigBirdLightningModule(pl.LightningModule):
                 f"mode={classifier_mode}  every={classifier_every}  depth={self.depth}"
             )
 
-        # Per-organism logit caches (cached mode only)
-        self._h_logit_cache = None
-        self._m_logit_cache = None
-
         self._time_this_step = False
         self._last_transformer_ms = None
         self._transformer_ms_accum = []
@@ -258,13 +246,6 @@ class BigBirdLightningModule(pl.LightningModule):
         mask = torch.zeros(B, N, dtype=torch.bool, device=logits.device)
         mask.scatter_(1, logits.topk(k, dim=1).indices, True)
         return mask
-
-    def _blend_logits(self, gt_mask, cache):
-        gt_logits = gt_mask.float() * 20.0 - 10.0
-        if cache is None or cache.shape != gt_logits.shape:
-            return gt_logits
-        mix_ratio = min(self.global_step / self.mix_steps, 0.8)
-        return (1 - mix_ratio) * gt_logits + mix_ratio * cache.clamp(-10.0, 10.0)
 
     def _forward_organism(self, seq, organism, ccre_mask=None):
         do_time = self._time_this_step and torch.cuda.is_available()
@@ -328,47 +309,6 @@ class BigBirdLightningModule(pl.LightningModule):
         pred = self.model._heads[organism](self.model._crop_and_pointwise(x))
         return pred, all_logits
 
-    def _forward_cached(self, seq, organism, gt_mask=None):
-        cache = self._h_logit_cache if organism == "human" else self._m_logit_cache
-
-        if cache is not None and cache.shape[0] != seq.shape[0]:
-            cache = None
-
-        if gt_mask is not None:
-            mixed = self._blend_logits(gt_mask, cache)
-            attn_mask = self._build_topk_mask(mixed)
-        elif cache is not None:
-            attn_mask = self._build_topk_mask(cache)
-        else:
-            attn_mask = None
-
-        do_time = self._time_this_step and torch.cuda.is_available()
-        if do_time:
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-
-        encoded = self.model._encode_ccre(seq)
-        x = self.model._run_transformer_blocks(encoded, is_global=attn_mask)
-
-        if do_time:
-            torch.cuda.synchronize()
-            self._transformer_ms_accum.append((time.perf_counter() - t0) * 1000)
-
-        logits = self.classifiers[0](x.detach())
-
-        if organism == "human":
-            self._h_logit_cache = logits.detach()
-        else:
-            self._m_logit_cache = logits.detach()
-
-        pred = self.model._heads[organism](self.model._crop_and_pointwise(x))
-        return pred, [logits]
-
-    def _forward_with_classifiers(self, seq, organism, gt_mask=None):
-        if self.classifier_mode == "cached":
-            return self._forward_cached(seq, organism, gt_mask)
-        return self._forward_progressive(seq, organism, gt_mask)
-
     def training_step(self, batch, batch_idx):
         self._transformer_ms_accum = []
 
@@ -381,8 +321,12 @@ class BigBirdLightningModule(pl.LightningModule):
             mask_h = batch["human"]["ccre_mask"].to(self.device, non_blocking=True)
             mask_m = batch["mouse"]["ccre_mask"].to(self.device, non_blocking=True)
 
-            pred_h, logits_h = self._forward_with_classifiers(seq_h, "human", gt_mask=mask_h)
-            pred_m, logits_m = self._forward_with_classifiers(seq_m, "mouse", gt_mask=mask_m)
+            pred_h, logits_h = self._forward_progressive(
+                seq_h, "human", gt_mask=mask_h
+            )
+            pred_m, logits_m = self._forward_progressive(
+                seq_m, "mouse", gt_mask=mask_m
+            )
 
             loss_h = poisson_loss(pred_h, tgt_h)
             loss_m = poisson_loss(pred_m, tgt_m)
@@ -448,7 +392,7 @@ class BigBirdLightningModule(pl.LightningModule):
         organism = "human" if dataloader_idx == 0 else "mouse"
 
         if self.is_ccre_mode and self.use_classifier:
-            pred, all_logits = self._forward_with_classifiers(seq, organism)
+            pred, all_logits = self._forward_progressive(seq, organism)
             gt_mask = batch.get("ccre_mask", None)
             if gt_mask is not None and dataloader_idx == 0:
                 gt_mask = gt_mask.to(self.device, non_blocking=True)

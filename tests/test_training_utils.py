@@ -62,10 +62,20 @@ def test_pearson_metric_known_correlations(prediction, expected):
 
 def test_lightning_module_rejects_invalid_classifier_options(tiny_config_factory):
     config = tiny_config_factory()
-    with pytest.raises(AssertionError, match="classifier_mode"):
+    with pytest.raises(ValueError, match="classifier_mode must be 'progressive'"):
         BigBirdLightningModule(config, classifier_mode="invalid")
     with pytest.raises(AssertionError, match="classifier_every"):
         BigBirdLightningModule(config, classifier_every=0)
+
+
+def test_lightning_module_rejects_unsafe_cached_classifier_mode(
+    tiny_config_factory,
+):
+    with pytest.raises(ValueError, match="not keyed by sequence identity"):
+        BigBirdLightningModule(
+            tiny_config_factory(),
+            classifier_mode="cached",
+        )
 
 
 def test_optimizer_separates_decay_and_no_decay_parameters(tiny_config_factory):
