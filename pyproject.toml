@@ -37,3 +37,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: full-length or computationally expensive CPU tests",
+    "gpu: tests that require a CUDA GPU",
+    "integration: tests that require external datasets or checkpoints",
+]
