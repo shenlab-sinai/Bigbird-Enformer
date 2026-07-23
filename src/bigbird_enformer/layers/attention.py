@@ -396,6 +396,42 @@ def _flex_ccre_attention(
     return out_sorted.gather(2, output_indices)
 
 
+def _local_window_padding_mask(
+    batch_size: int,
+    num_blocks: int,
+    block_size: int,
+    device: torch.device,
+    *,
+    include_global: bool = False,
+) -> torch.Tensor:
+    """Mask dummy blocks used to batch the first and last local windows."""
+    valid = torch.ones(
+        num_blocks,
+        3 * block_size,
+        dtype=torch.bool,
+        device=device,
+    )
+    valid[0, :block_size] = False
+    valid[-1, -block_size:] = False
+
+    if include_global:
+        valid = torch.cat(
+            [
+                torch.ones(
+                    num_blocks,
+                    1,
+                    dtype=torch.bool,
+                    device=device,
+                ),
+                valid,
+            ],
+            dim=-1,
+        )
+
+    valid = valid.unsqueeze(0).expand(batch_size, -1, -1)
+    return valid.reshape(batch_size * num_blocks, 1, 1, valid.shape[-1])
+
+
 class FullAttention(nn.Module):
     def __init__(
         self,
@@ -692,7 +728,21 @@ class BigBirdAttention(nn.Module):
         q_flat   = qx_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,         dk)
         k_flat   = k_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS, dk)
         v_flat   = v_full.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 1 + 3 * BS, dv)
-        out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
+        attn_mask = _local_window_padding_mask(
+            B,
+            nb,
+            BS,
+            x.device,
+            include_global=True,
+        )
+        out_flat = F.scaled_dot_product_attention(
+            q_flat,
+            k_flat,
+            v_flat,
+            attn_mask=attn_mask,
+            dropout_p=drop,
+            is_causal=False,
+        )
 
         out_x = out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
         out   = torch.cat([out_g, out_x], dim=2)
@@ -795,7 +845,15 @@ class BigBirdAttentionAblation(nn.Module):
         q_flat   = q_blk.permute(0, 2, 1, 3, 4).reshape(B * nb, H, BS,     dk)
         k_flat   = k_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dk)
         v_flat   = v_win.permute(0, 2, 1, 3, 4).reshape(B * nb, H, 3 * BS, dv)
-        out_flat = F.scaled_dot_product_attention(q_flat, k_flat, v_flat, dropout_p=drop, is_causal=False)
+        attn_mask = _local_window_padding_mask(B, nb, BS, x.device)
+        out_flat = F.scaled_dot_product_attention(
+            q_flat,
+            k_flat,
+            v_flat,
+            attn_mask=attn_mask,
+            dropout_p=drop,
+            is_causal=False,
+        )
 
         out = out_flat.view(B, nb, H, BS, dv).permute(0, 2, 1, 3, 4).reshape(B, H, N, dv)
         out = out.transpose(1, 2).contiguous().view(B, N, self.inner_v)

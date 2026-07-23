@@ -153,6 +153,102 @@ def test_full_sdpa_matches_einsum():
     torch.testing.assert_close(sdpa(inputs), einsum(inputs), rtol=1e-5, atol=1e-6)
 
 
+def test_bigbird_global_token_attention_matches_dense_boundary_reference():
+    torch.manual_seed(0)
+    layer = BigBirdAttention(
+        12,
+        heads=2,
+        dim_key=4,
+        dim_value=4,
+        block_size=2,
+        dropout=0.0,
+    ).eval()
+    inputs = torch.randn(2, 9, 12)
+
+    batch_size, total_length, _ = inputs.shape
+    local_length = total_length - 1
+    q = layer.to_q(inputs).view(
+        batch_size, total_length, layer.heads, layer.dim_key
+    ).transpose(1, 2)
+    k = layer.to_k(inputs).view(
+        batch_size, total_length, layer.heads, layer.dim_key
+    ).transpose(1, 2)
+    v = layer.to_v(inputs).view(
+        batch_size, total_length, layer.heads, layer.dim_value
+    ).transpose(1, 2)
+
+    block_ids = torch.arange(local_length) // layer.block_size
+    local = (block_ids[:, None] - block_ids[None, :]).abs() <= 1
+    allowed = torch.zeros(total_length, total_length, dtype=torch.bool)
+    allowed[0, :] = True
+    allowed[1:, 0] = True
+    allowed[1:, 1:] = local
+
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=allowed.view(1, 1, total_length, total_length),
+        dropout_p=0.0,
+    )
+    reference = reference.transpose(1, 2).contiguous().view(
+        batch_size, total_length, layer.inner_v
+    )
+    reference = layer.to_out(reference)
+
+    torch.testing.assert_close(
+        layer(inputs),
+        reference,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_bigbird_ablation_attention_matches_dense_boundary_reference():
+    torch.manual_seed(0)
+    layer = BigBirdAttentionAblation(
+        12,
+        heads=2,
+        dim_key=4,
+        dim_value=4,
+        block_size=2,
+        dropout=0.0,
+    ).eval()
+    inputs = torch.randn(2, 8, 12)
+
+    batch_size, seq_len, _ = inputs.shape
+    q = layer.to_q(inputs).view(
+        batch_size, seq_len, layer.heads, layer.dim_key
+    ).transpose(1, 2)
+    k = layer.to_k(inputs).view(
+        batch_size, seq_len, layer.heads, layer.dim_key
+    ).transpose(1, 2)
+    v = layer.to_v(inputs).view(
+        batch_size, seq_len, layer.heads, layer.dim_value
+    ).transpose(1, 2)
+
+    block_ids = torch.arange(seq_len) // layer.block_size
+    allowed = (block_ids[:, None] - block_ids[None, :]).abs() <= 1
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=allowed.view(1, 1, seq_len, seq_len),
+        dropout_p=0.0,
+    )
+    reference = reference.transpose(1, 2).contiguous().view(
+        batch_size, seq_len, layer.inner_v
+    )
+    reference = layer.to_out(reference)
+
+    torch.testing.assert_close(
+        layer(inputs),
+        reference,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 @pytest.mark.parametrize(
     "mask",
     [

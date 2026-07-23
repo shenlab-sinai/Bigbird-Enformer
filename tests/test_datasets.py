@@ -32,16 +32,89 @@ def test_single_organism_dataset_loads_split_and_mask(tmp_path, write_npz):
     torch.testing.assert_close(item["ccre_mask"], torch.from_numpy(expected_mask))
 
 
-def test_single_organism_dataset_uses_fixed_empty_mask_fallback(tmp_path, write_npz):
+def test_single_organism_dataset_rejects_missing_mask(tmp_path, write_npz):
     data_dir = tmp_path / "data"
     mask_dir = tmp_path / "masks"
     write_npz(data_dir, "test-000000.npz")
     mask_dir.mkdir()
 
-    item = SingleOrganismDataset(data_dir, "test", ccre_mask_dir=mask_dir)[0]
+    with pytest.raises(FileNotFoundError, match="missing 1 cCRE mask"):
+        SingleOrganismDataset(data_dir, "test", ccre_mask_dir=mask_dir)
 
-    assert item["ccre_mask"].shape == (1536,)
-    assert not item["ccre_mask"].any()
+
+def test_single_organism_dataset_validates_every_mask_before_loading(
+    tmp_path,
+    write_npz,
+):
+    data_dir = tmp_path / "data"
+    mask_dir = tmp_path / "masks"
+    write_npz(data_dir, "train-000000.npz")
+    write_npz(data_dir, "train-000001.npz")
+    mask_dir.mkdir()
+    np.save(mask_dir / "train-000000.npy", np.zeros(4, dtype=bool))
+
+    with pytest.raises(
+        FileNotFoundError,
+        match=r"train-000001\.npy",
+    ):
+        SingleOrganismDataset(data_dir, "train", ccre_mask_dir=mask_dir)
+
+
+@pytest.mark.parametrize(
+    ("mask", "message"),
+    [
+        (np.zeros((2, 2), dtype=bool), "expected one dimension"),
+        (np.zeros(4, dtype=np.int8), "expected Boolean dtype"),
+        (np.zeros(3, dtype=bool), "expected length 4"),
+    ],
+)
+def test_single_organism_dataset_rejects_invalid_mask(
+    tmp_path,
+    write_npz,
+    mask,
+    message,
+):
+    data_dir = tmp_path / "data"
+    mask_dir = tmp_path / "masks"
+    write_npz(data_dir, "train-000000.npz")
+    mask_dir.mkdir()
+    np.save(mask_dir / "train-000000.npy", mask)
+
+    with pytest.raises(ValueError, match=message):
+        SingleOrganismDataset(
+            data_dir,
+            "train",
+            ccre_mask_dir=mask_dir,
+            expected_mask_length=4,
+        )
+
+
+def test_zipped_dataset_rejects_missing_mask_before_training(
+    tmp_path,
+    write_npz,
+):
+    human_dir = tmp_path / "human"
+    mouse_dir = tmp_path / "mouse"
+    human_mask_dir = tmp_path / "human_masks"
+    mouse_mask_dir = tmp_path / "mouse_masks"
+    write_npz(human_dir, "train-000000.npz")
+    write_npz(mouse_dir, "train-000000.npz")
+    human_mask_dir.mkdir()
+    mouse_mask_dir.mkdir()
+    np.save(human_mask_dir / "train-000000.npy", np.zeros(4, dtype=bool))
+
+    with pytest.raises(
+        FileNotFoundError,
+        match=r"mouse_masks/train-000000\.npy",
+    ):
+        ZippedOrganismDataset(
+            human_dir,
+            mouse_dir,
+            "train",
+            human_ccre_mask_dir=human_mask_dir,
+            mouse_ccre_mask_dir=mouse_mask_dir,
+            augment=False,
+        )
 
 
 def test_zipped_dataset_cycles_shorter_organism(tmp_path, write_npz):

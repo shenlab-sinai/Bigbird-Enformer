@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-from .models.enformer_plus import Enformer
+from .models.enformer_plus import Enformer, SEQUENCE_LENGTH
 from .utils.config import EnformerConfig, load_experiment_config
 
 #  Performance monitor
@@ -622,10 +622,93 @@ def augment_pair(seq, target, ccre_mask=None, max_shift=3):
             ccre_mask = ccre_mask[::-1].copy()
     return seq, target, ccre_mask
 
+
+def _mask_path(mask_dir, npz_path):
+    return mask_dir / Path(npz_path).with_suffix(".npy").name
+
+
+def _validate_mask_files(
+    files,
+    mask_dir,
+    dataset_name,
+    expected_mask_length=None,
+):
+    if mask_dir is None:
+        return
+    if not mask_dir.is_dir():
+        raise FileNotFoundError(
+            f"cCRE mask directory does not exist for {dataset_name}: {mask_dir}"
+        )
+
+    mask_paths = [_mask_path(mask_dir, npz_path) for npz_path in files]
+    missing = [path for path in mask_paths if not path.is_file()]
+    if missing:
+        preview = ", ".join(str(path) for path in missing[:5])
+        remainder = len(missing) - 5
+        if remainder > 0:
+            preview += f", ... and {remainder} more"
+        raise FileNotFoundError(
+            f"missing {len(missing)} cCRE mask file(s) for {dataset_name}: "
+            f"{preview}"
+        )
+
+    validated_length = expected_mask_length
+    invalid = []
+    for mask_path in mask_paths:
+        try:
+            mask = np.load(mask_path, mmap_mode="r", allow_pickle=False)
+        except Exception as exc:
+            invalid.append(f"{mask_path}: cannot load ({exc})")
+            continue
+
+        if mask.ndim != 1:
+            invalid.append(
+                f"{mask_path}: expected one dimension, got shape {mask.shape}"
+            )
+            continue
+        if mask.dtype != np.bool_:
+            invalid.append(
+                f"{mask_path}: expected Boolean dtype, got {mask.dtype}"
+            )
+            continue
+        if mask.shape[0] == 0:
+            invalid.append(f"{mask_path}: mask must not be empty")
+            continue
+
+        if validated_length is None:
+            validated_length = mask.shape[0]
+        elif mask.shape[0] != validated_length:
+            invalid.append(
+                f"{mask_path}: expected length {validated_length}, "
+                f"got {mask.shape[0]}"
+            )
+
+    if invalid:
+        preview = "; ".join(invalid[:5])
+        remainder = len(invalid) - 5
+        if remainder > 0:
+            preview += f"; ... and {remainder} more"
+        raise ValueError(
+            f"invalid cCRE mask file(s) for {dataset_name}: {preview}"
+        )
+
+
 class SingleOrganismDataset(torch.utils.data.Dataset):
-    def __init__(self, npz_dir, split, ccre_mask_dir=None):
+    def __init__(
+        self,
+        npz_dir,
+        split,
+        ccre_mask_dir=None,
+        expected_mask_length=None,
+    ):
         self.files = sorted(glob.glob(str(Path(npz_dir) / f"{split}-*.npz")))
         self.ccre_mask_dir = Path(ccre_mask_dir) if ccre_mask_dir else None
+        _validate_mask_files(
+            self.files,
+            self.ccre_mask_dir,
+            f"{split}/{Path(npz_dir).name}",
+            expected_mask_length,
+        )
         print(f"[{split}/{Path(npz_dir).name}] {len(self.files)} files")
 
     def __len__(self):
@@ -638,24 +721,35 @@ class SingleOrganismDataset(torch.utils.data.Dataset):
             "target": torch.tensor(data["target"], dtype=torch.float32),
         }
         if self.ccre_mask_dir is not None:
-            mask_path = self.ccre_mask_dir / Path(self.files[idx]).name.replace(".npz", ".npy")
-            if mask_path.exists():
-                item["ccre_mask"] = torch.tensor(np.load(mask_path), dtype=torch.bool)
-            else:
-                item["ccre_mask"] = torch.zeros(1536, dtype=torch.bool)
+            mask_path = _mask_path(self.ccre_mask_dir, self.files[idx])
+            item["ccre_mask"] = torch.from_numpy(
+                np.load(mask_path, allow_pickle=False)
+            )
         return item
 
 
 class ZippedOrganismDataset(torch.utils.data.Dataset):
     def __init__(self, human_dir, mouse_dir, split,
                  human_ccre_mask_dir=None, mouse_ccre_mask_dir=None,
-                 augment=True, max_shift=3):
+                 augment=True, max_shift=3, expected_mask_length=None):
         self.human_files = sorted(glob.glob(str(Path(human_dir) / f"{split}-*.npz")))
         self.mouse_files = sorted(glob.glob(str(Path(mouse_dir) / f"{split}-*.npz")))
         self.augment = augment
         self.max_shift = max_shift
         self.human_mask_dir = Path(human_ccre_mask_dir) if human_ccre_mask_dir else None
         self.mouse_mask_dir = Path(mouse_ccre_mask_dir) if mouse_ccre_mask_dir else None
+        _validate_mask_files(
+            self.human_files,
+            self.human_mask_dir,
+            f"{split}/{Path(human_dir).name}",
+            expected_mask_length,
+        )
+        _validate_mask_files(
+            self.mouse_files,
+            self.mouse_mask_dir,
+            f"{split}/{Path(mouse_dir).name}",
+            expected_mask_length,
+        )
         print(
             f"[{split}] human={len(self.human_files)}  mouse={len(self.mouse_files)}  "
             f"augment={augment}  "
@@ -669,10 +763,10 @@ class ZippedOrganismDataset(torch.utils.data.Dataset):
     def _load_mask(self, mask_dir, npz_path):
         if mask_dir is None:
             return None
-        mask_path = mask_dir / Path(npz_path).name.replace(".npz", ".npy")
-        if mask_path.exists():
-            return np.load(mask_path)
-        return np.zeros(1536, dtype=bool)
+        return np.load(
+            _mask_path(mask_dir, npz_path),
+            allow_pickle=False,
+        )
 
     def __getitem__(self, idx):
         h_path = self.human_files[idx % len(self.human_files)]
@@ -733,6 +827,7 @@ class EnformerDataModule(pl.LightningDataModule):
         train_batch_size=8,
         val_batch_size=8,
         num_workers=4,
+        expected_mask_length=None,
     ):
         super().__init__()
         self.human_npz_dir = human_npz_dir
@@ -742,6 +837,7 @@ class EnformerDataModule(pl.LightningDataModule):
         self.train_batch_size = int(train_batch_size)
         self.val_batch_size = int(val_batch_size)
         self.num_workers = int(num_workers)
+        self.expected_mask_length = expected_mask_length
 
     def setup(self, stage=None):
         self.train_ds = ZippedOrganismDataset(
@@ -749,14 +845,17 @@ class EnformerDataModule(pl.LightningDataModule):
             human_ccre_mask_dir=self.human_ccre_mask_dir,
             mouse_ccre_mask_dir=self.mouse_ccre_mask_dir,
             augment=True, max_shift=3,
+            expected_mask_length=self.expected_mask_length,
         )
         self.val_human = SingleOrganismDataset(
             self.human_npz_dir, "valid",
             ccre_mask_dir=self.human_ccre_mask_dir,
+            expected_mask_length=self.expected_mask_length,
         )
         self.val_mouse = SingleOrganismDataset(
             self.mouse_npz_dir, "valid",
             ccre_mask_dir=self.mouse_ccre_mask_dir,
+            expected_mask_length=self.expected_mask_length,
         )
 
     def train_dataloader(self):
@@ -828,6 +927,9 @@ if __name__ == "__main__":
         mouse_npz_dir=MOUSE_NPZ_DIR,
         human_ccre_mask_dir=HUMAN_CCRE_MASK_DIR,
         mouse_ccre_mask_dir=MOUSE_CCRE_MASK_DIR,
+        expected_mask_length=(
+            SEQUENCE_LENGTH // (2 ** config.num_downsamples)
+        ),
         **dataloader_config,
     )
 
