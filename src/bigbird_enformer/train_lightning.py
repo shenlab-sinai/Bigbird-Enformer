@@ -251,12 +251,30 @@ class BigBirdLightningModule(pl.LightningModule):
         self.val_loss_sum = 0.0
         self.val_loss_n = 0
 
-    def _build_topk_mask(self, logits):
-        B, N = logits.shape
+    def _build_topk_mask(self, scores):
+        B, N = scores.shape
         k = max(1, min(self.mean_ccre_k, N))
-        mask = torch.zeros(B, N, dtype=torch.bool, device=logits.device)
-        mask.scatter_(1, logits.topk(k, dim=1).indices, True)
+        mask = torch.zeros(B, N, dtype=torch.bool, device=scores.device)
+        mask.scatter_(1, scores.topk(k, dim=1).indices, True)
         return mask
+
+    @staticmethod
+    def _mix_topk_probabilities(logits, gt_mask, mix_ratio):
+        predicted_probabilities = logits.sigmoid()
+        if gt_mask is None:
+            return predicted_probabilities
+        if predicted_probabilities.shape != gt_mask.shape:
+            raise ValueError(
+                "classifier probabilities and ground-truth mask must have "
+                "the same shape for top-k mixing, got "
+                f"{tuple(predicted_probabilities.shape)} and "
+                f"{tuple(gt_mask.shape)}"
+            )
+        return torch.lerp(
+            gt_mask.to(dtype=predicted_probabilities.dtype),
+            predicted_probabilities,
+            mix_ratio,
+        )
 
     def _forward_organism(self, seq, organism, ccre_mask=None):
         do_time = self._time_this_step and torch.cuda.is_available()
@@ -281,26 +299,21 @@ class BigBirdLightningModule(pl.LightningModule):
 
         if self.training and gt_mask is not None:
             mix_ratio = min(self.global_step / self.mix_steps, 0.8)
-            gt_logits = gt_mask.float() * 20.0 - 10.0
+            routing_gt_mask = gt_mask
         else:
             mix_ratio = 1.0
-            gt_logits = None
+            routing_gt_mask = None
 
         for i, classifier in enumerate(self.classifiers):
             logits = classifier(x.detach())
             all_logits.append(logits)
 
-            if self.training and gt_logits is not None:
-                clamped = logits.clamp(-10.0, 10.0)
-                mixed = (
-                    (1 - mix_ratio) * gt_logits + mix_ratio * clamped
-                    if clamped.shape == gt_logits.shape
-                    else clamped
-                )
-            else:
-                mixed = logits
-
-            attn_mask = self._build_topk_mask(mixed)
+            selection_probabilities = self._mix_topk_probabilities(
+                logits,
+                routing_gt_mask,
+                mix_ratio,
+            )
+            attn_mask = self._build_topk_mask(selection_probabilities)
 
             if do_time:
                 torch.cuda.synchronize()

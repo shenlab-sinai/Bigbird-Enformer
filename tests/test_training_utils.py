@@ -91,6 +91,32 @@ def test_resolved_ccre_selection_is_saved_in_checkpoint_hparams(
     assert module.hparams["ccre_condition"] == "no_ctcf"
 
 
+def test_topk_routing_mixes_ground_truth_and_predicted_probabilities():
+    predicted_probabilities = torch.tensor([[0.2, 0.9]])
+    logits = torch.logit(predicted_probabilities)
+    gt_mask = torch.tensor([[True, False]])
+
+    mixed = BigBirdLightningModule._mix_topk_probabilities(
+        logits,
+        gt_mask,
+        mix_ratio=0.25,
+    )
+
+    torch.testing.assert_close(mixed, torch.tensor([[0.8, 0.225]]))
+
+
+def test_topk_routing_uses_predicted_probabilities_without_ground_truth():
+    logits = torch.tensor([[-2.0, 0.0, 2.0]])
+
+    mixed = BigBirdLightningModule._mix_topk_probabilities(
+        logits,
+        gt_mask=None,
+        mix_ratio=1.0,
+    )
+
+    torch.testing.assert_close(mixed, logits.sigmoid())
+
+
 def test_optimizer_separates_decay_and_no_decay_parameters(tiny_config_factory):
     module = BigBirdLightningModule(
         tiny_config_factory(),
