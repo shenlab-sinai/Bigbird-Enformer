@@ -7,6 +7,21 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
 
+
+def _resolve_dim_value(dim: int, heads: int, dim_value: int | None) -> int:
+    """Use the published Enformer value width unless explicitly overridden."""
+    if dim_value is not None:
+        if dim_value <= 0:
+            raise ValueError(f"dim_value must be positive, got {dim_value}")
+        return int(dim_value)
+    if dim % heads != 0:
+        raise ValueError(
+            "dim must be divisible by heads when dim_value is omitted, "
+            f"got dim={dim}, heads={heads}"
+        )
+    return dim // heads
+
+
 #  Relative positional encoding helpers
 
 def get_positional_features_exponential(
@@ -120,7 +135,7 @@ class RelBigBirdCCREAttention(nn.Module):
         dim: int,
         heads: int = 8,
         dim_key: int = 64,
-        dim_value: int = 64,
+        dim_value: int | None = None,
         block_size: int = 128,
         dropout: float = 0.0,
         pos_dropout: float = 0.01,
@@ -129,6 +144,7 @@ class RelBigBirdCCREAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads      = heads
         self.dim_key    = dim_key
         self.dim_value  = dim_value
@@ -230,7 +246,7 @@ class RelFullAttention(nn.Module):
         dim: int,
         heads: int = 8,
         dim_key: int = 64,
-        dim_value: int = 64,
+        dim_value: int | None = None,
         dropout: float = 0.0,
         pos_dropout: float = 0.01,
         num_rel_pos_features: int = None,
@@ -238,6 +254,7 @@ class RelFullAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads      = heads
         self.dim_key    = dim_key
         self.dim_value  = dim_value
@@ -438,11 +455,12 @@ class FullAttention(nn.Module):
         dim: int,
         heads: int = 8,
         dim_key: int = 64,
-        dim_value: int = 64,
+        dim_value: int | None = None,
         dropout: float = 0.0,
         **kwargs,
     ):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads     = heads
         self.dim_key   = dim_key
         self.dim_value = dim_value
@@ -477,11 +495,12 @@ class FullAttentionEinsum(nn.Module):
         dim: int,
         heads: int = 8,
         dim_key: int = 64,
-        dim_value: int = 64,
+        dim_value: int | None = None,
         dropout: float = 0.0,
         **kwargs,
     ):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads     = heads
         self.dim_key   = dim_key
         self.dim_value = dim_value
@@ -525,12 +544,13 @@ class BigBirdCCREAttentionEinsum(nn.Module):
         dim: int,
         heads: int = 8,
         dim_key: int = 64,
-        dim_value: int = 64,
+        dim_value: int | None = None,
         block_size: int = 128,
         dropout: float = 0.0,
         **kwargs,
     ):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads      = heads
         self.dim_key    = dim_key
         self.dim_value  = dim_value
@@ -578,13 +598,14 @@ class BigBirdCCREAttention(nn.Module):
         dim: int,
         heads: int = 8,
         dim_key: int = 64,
-        dim_value: int = 64,
+        dim_value: int | None = None,
         block_size: int = 128,
         dropout: float = 0.0,
         backend: str = "auto",
         **kwargs,
     ):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         if backend not in {"auto", "flex", "sdpa"}:
             raise ValueError(
                 "BigBirdCCREAttention backend must be 'auto', 'flex', or "
@@ -673,9 +694,10 @@ class BigBirdAttention(nn.Module):
     BigBird attention with ONE learnable global token prepended at position 0.
     Used with SingleGlobalTokenInjector / SingleGlobalTokenRemover.
     """
-    def __init__(self, dim, heads=8, dim_key=64, dim_value=64,
+    def __init__(self, dim, heads=8, dim_key=64, dim_value=None,
                  block_size=128, dropout=0.0, **kwargs):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads      = heads
         self.dim_key    = dim_key
         self.dim_value  = dim_value
@@ -751,9 +773,10 @@ class BigBirdAttention(nn.Module):
 
 
 class BlockSparseAttention(nn.Module):
-    def __init__(self, dim, heads=8, block_size=129, dim_key=64, dim_value=64,
+    def __init__(self, dim, heads=8, block_size=129, dim_key=64, dim_value=None,
                  dropout=0.0, **kwargs):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads      = heads
         self.block_size = block_size
         self.dim_key    = dim_key
@@ -804,9 +827,10 @@ class BlockSparseAttention(nn.Module):
 
 class BigBirdAttentionAblation(nn.Module):
     """BigBird local-window attention — no global tokens."""
-    def __init__(self, dim, heads=8, dim_key=64, dim_value=64,
+    def __init__(self, dim, heads=8, dim_key=64, dim_value=None,
                  block_size=128, dropout=0.0, **kwargs):
         super().__init__()
+        dim_value = _resolve_dim_value(dim, heads, dim_value)
         self.heads      = heads
         self.dim_key    = dim_key
         self.dim_value  = dim_value

@@ -6,6 +6,9 @@ model:
     human: 5313
     mouse: 1643
   target_length: 896
+  # Published Enformer: Q/K size 64 per head; V size 1536 / 8 = 192.
+  attn_dim_key: 64
+  attn_dim_value: 192
 
   # Attention mode choices:
   #   ccre_bigbird: local blocks plus selected cCRE positions as global tokens

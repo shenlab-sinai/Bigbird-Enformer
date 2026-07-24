@@ -29,6 +29,17 @@ This project compares three attention modes under the same training pipeline and
 - Complexity: **O(N²)**
 - Best accuracy baseline, but expensive at long sequence lengths.
 
+The production model follows the published Enformer attention widths: model
+dimension 1536, 8 heads, key/query size 64 per head, and value size 192 per
+head. The concatenated values therefore retain the full 1536-dimensional model
+width. `EnformerConfig` derives the value size as `dim // heads` unless
+`attn_dim_value` is explicitly set.
+
+Checkpoints trained with the earlier `attn_dim_value=64` bottleneck have
+512-wide concatenated values and are not shape-compatible with the corrected
+192-wide model. Reconstruct those checkpoints with an explicit
+`attn_dim_value: 64`; use 192 for new published-Enformer-compatible runs.
+
 ---
 
 ### 2. BigBird-Style Block Sparse Attention

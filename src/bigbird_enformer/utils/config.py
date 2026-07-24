@@ -34,7 +34,7 @@ class EnformerConfig(PretrainedConfig):
         output_heads=dict(human=5313, mouse=1643),
         target_length=896,
         attn_dim_key=64,
-        attn_dim_value=64,
+        attn_dim_value=None,
         block_size=128,
 
         attention_mode="block_sparse",
@@ -60,7 +60,18 @@ class EnformerConfig(PretrainedConfig):
         self.output_heads = output_heads
         self.target_length = target_length
         self.attn_dim_key = attn_dim_key
-        self.attn_dim_value = attn_dim_value
+        if attn_dim_value is None:
+            if dim % heads != 0:
+                raise ValueError(
+                    "dim must be divisible by heads when attn_dim_value is "
+                    f"omitted, got dim={dim}, heads={heads}"
+                )
+            attn_dim_value = dim // heads
+        elif attn_dim_value <= 0:
+            raise ValueError(
+                f"attn_dim_value must be positive, got {attn_dim_value}"
+            )
+        self.attn_dim_value = int(attn_dim_value)
         self.block_size = block_size
 
         assert attention_mode in {"block_sparse", "full", "bigbird", "bigbird_ablation", "ccre_bigbird"}, \

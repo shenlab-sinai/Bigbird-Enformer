@@ -153,6 +153,17 @@ def test_full_sdpa_matches_einsum():
     torch.testing.assert_close(sdpa(inputs), einsum(inputs), rtol=1e-5, atol=1e-6)
 
 
+def test_attention_value_dimension_defaults_to_model_width_per_head():
+    full = FullAttention(12, heads=2, dim_key=4)
+    ccre = BigBirdCCREAttention(12, heads=2, dim_key=4, block_size=4)
+
+    for layer in (full, ccre):
+        assert layer.dim_value == 6
+        assert layer.inner_v == 12
+        assert layer.to_v.out_features == 12
+        assert layer.to_out.in_features == 12
+
+
 def test_bigbird_global_token_attention_matches_dense_boundary_reference():
     torch.manual_seed(0)
     layer = BigBirdAttention(

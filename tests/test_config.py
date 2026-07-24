@@ -38,6 +38,26 @@ def test_default_output_heads_are_available():
     assert config.output_heads == {"human": 5313, "mouse": 1643}
 
 
+def test_default_attention_dimensions_match_published_enformer():
+    config = EnformerConfig()
+
+    assert config.attn_dim_key == 64
+    assert config.attn_dim_value == 192
+    assert config.heads * config.attn_dim_value == config.dim
+
+
+def test_value_dimension_defaults_to_model_width_per_head():
+    config = EnformerConfig(dim=32, heads=4)
+
+    assert config.attn_dim_value == 8
+
+
+def test_explicit_legacy_value_dimension_is_preserved():
+    config = EnformerConfig(attn_dim_value=64)
+
+    assert config.attn_dim_value == 64
+
+
 @pytest.mark.parametrize("backend", ["auto", "flex", "sdpa", "einsum"])
 def test_supported_attention_backends(backend):
     assert EnformerConfig(attention_backend=backend).attention_backend == backend
@@ -71,6 +91,9 @@ def test_repository_ccre_config_loads_with_auto_backend():
     assert config.attention_mode == "ccre_bigbird"
     assert config.attention_backend == "auto"
     assert config.attn_dropout == 0.0
+    assert config.attn_dim_key == 64
+    assert config.attn_dim_value == 192
+    assert config.heads * config.attn_dim_value == config.dim
 
 
 def test_repository_ccre_config_exposes_topk_parameter():
